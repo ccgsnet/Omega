@@ -114,7 +114,7 @@ api_token_var: "OPENAIAPI_API_KEY"
 # LLM endpoint URL.
 openaiapi_url: "http://localhost:11434/v1/"
 # Default model
-openaiapi_model: "qwen3.5:9b"
+openaiapi_model: "ornith-1.5:9b"
 
 # ASICloud
 # Enabled with provider: ASICloud

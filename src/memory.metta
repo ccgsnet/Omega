@@ -7,6 +7,7 @@
 
 (= (initMemory)
    (progn (log INFO "memory" "Initializing memory")
+          (log INFO "memory" "Beliefs, formal atoms and remembered text are also kept in the &das space")
           (configure maxFeedback 50000)
           (configure maxRecallItems 20)
           (configure maxEpisodeRecallLines 20)
@@ -50,9 +51,12 @@
 (= (appendToHistory $addition)
    (append-file-raw (library Omega ./memory/history.metta) (swrite $addition)))
 
+; Chroma answers similarity queries; DAS keeps the same text as a (Memory time text) atom.
 (= (remember $str)
-   (progn (py-call (lib_chromadb.remember $str (embed $str) (get_time_as_string)))
-          REMEMBER-SUCCESS))
+   (let $time (get_time_as_string)
+     (progn (py-call (lib_chromadb.remember $str (embed $str) $time))
+            (das-remember $time $str)
+            REMEMBER-SUCCESS)))
 
 (= (query $str)
    (py-call (lib_chromadb.query (embed $str) (maxRecallItems))))

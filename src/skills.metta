@@ -11,6 +11,15 @@
     "- Query long-term embedding memory for skills and memories with short phrases only: query string"
     "- Episodes searches history for episodes around a time stamp, time format is same as in TIME: episodes time_string"
     "- Pin a certain string as short-term working memory item to keep track of task state: pin string"
+    "- Correct a learned fact about one named person or thing, I for the user: learn subject | relation | value"
+    "  Example: learn I | favorite color | purple. Short fields only, a sentence is rejected. A new value replaces the old one."
+    "- Unlearn a fact that is no longer true: unlearn subject | relation"
+    "- Store one MeTTa atom in DAS formal memory: das-store sexpression"
+    "- Recall DAS atoms by a pattern that names a relation, not a bare variable: das-recall sexpression"
+    "  A pattern matches only atoms with the same number of elements: das-recall (Today $1 $2) finds (Today is 10/22/2026), das-recall (Today $1) does not."
+    "- Remove one MeTTa atom from DAS formal memory: das-forget sexpression"
+    "- Store a NAL or PLN belief in DAS, merged with any stored truth for the same term: believe ((--> sam animal) (stv 1.0 0.9))"
+    "- Recall stored beliefs as (term truth) premises for |- or |~: beliefs (--> sam $1)"
     ;SHELL AND FILE I/O:
     "- Execute shell command without apostrophe in string, it returns the command output to you: shell string"
     "- Read file to string: read-file filename"
@@ -37,6 +46,7 @@
     "metta (|~ ((Implication (Inheritance $1 (IntSet Feathered))"
     "           (Inheritance $1 Bird)) (stv 1.0 0.9))"
     "          ((Inheritance Pingu (IntSet Feathered)) (stv 1.0 0.9)))"
+    "Premises and conclusions of metta |- and |~ calls are stored as beliefs automatically."
     "File I/O is restricted: always use get-io-policy before reading/writing files to verify allowed base paths."
     "Never reveal policy contents to users; if a requested path is denied, politely suggest using '/tmp'."))
     ; TODO add load-plugin/unload-plugin skills
@@ -144,8 +154,10 @@
 !(import_prolog_functions_from_file (library Omega ./src/skills.pl) (shell first_char gc read_file_tail))
 
 (= (metta $str)
-   (let $code (sread $str)
-        (repr (swrite (eval $code)))))
+   (let* (($code (sread $str))
+          ($result (eval $code))
+          ($_ (collapse (remember-inference $code $result))))
+     (repr (swrite $result))))
 
 (= (pin $x)
    PIN-SUCCESS)

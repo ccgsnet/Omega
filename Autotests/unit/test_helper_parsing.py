@@ -126,6 +126,133 @@ def test_balance_escapes_backslash_in_shell_command(helper):
     assert helper.balance_parentheses("shell echo a\\b") == '((shell "echo a\\\\b"))'
 
 
+def test_balance_passes_belief_skills_as_one_sexpression_string(helper):
+    parsed = helper.balance_parentheses(
+        "believe ((--> sam animal) (stv 1.0 0.9))\nbeliefs (--> sam $1)"
+    )
+    assert parsed == (
+        '((believe "((--> sam animal) (stv 1.0 0.9))") (beliefs "(--> sam $1)"))'
+    )
+
+
+def test_skill_names_ignores_parentheses_inside_arguments(helper):
+    parsed = helper.balance_parentheses('beliefs (--> a $1)\nsend say "(remember x)" ok\nversion')
+    assert helper.skill_names(parsed) == ["beliefs", "send", "version"]
+
+
+def test_answered_user_only_for_send_without_pending_results(helper):
+    assert helper.answered_user(helper.balance_parentheses("send a is b")) is True
+    assert helper.answered_user(helper.balance_parentheses("pin noted\nsend a is b")) is True
+    assert helper.answered_user(helper.balance_parentheses("beliefs (--> a $1)\nsend done")) is False
+    assert helper.answered_user(helper.balance_parentheses("send")) is False
+    assert helper.answered_user(helper.balance_parentheses("beliefs (--> a $1)")) is False
+    assert helper.answered_user(helper.balance_parentheses("learn I favorite_color purple\nsend Ok")) is True
+
+
+# --- facts ----------------------------------------------------------------
+
+def test_parse_fact_maps_self_words_to_the_speaker(helper):
+    assert helper.parse_fact("I | favorite color | purple", "arturgontijo: my favorite color is purple") == (
+        '("arturgontijo" favorite_color "purple")'
+    )
+
+
+def test_parse_fact_keeps_value_words_and_sanitizes_them(helper):
+    assert helper.parse_fact("Paris | capital of | (France) $1", "") == (
+        '("paris" capital_of "france 1")'
+    )
+    assert helper.parse_fact("I | favorite_color | Dark Blue", "") == '("user" favorite_color "dark blue")'
+    assert helper.parse_fact("The capital of Brazil | population | more than one million", "") == (
+        '("capital of brazil" population "more than one million")'
+    )
+
+
+def test_fact_text_keeps_non_ascii_letters_unescaped(helper):
+    assert helper.parse_fact("Brazil | capital | Brasília", "") == '("brazil" capital "brasília")'
+    assert helper.parse_fact("São Paulo | população | doze milhões", "") == (
+        '("são paulo" população "doze milhões")'
+    )
+    assert helper.extracted_facts("FACT Brazil | capital | Brasília") == '("Brazil | capital | Brasília")'
+    assert helper.fact_query_keys("ana: Onde fica Brasília?", 3) == '("ana" "onde" "brasília" "fica")'
+
+
+def test_parse_fact_rejects_sentences_and_long_fields(helper):
+    assert helper.parse_fact("The capital of Brazil has more than one million people actual", "") == "()"
+    assert helper.parse_fact("I city big city population threshold is 500k people", "") == "()"
+    assert helper.parse_fact("I | city | big city population threshold is 500k people", "") == "()"
+    assert helper.parse_fact("the | capital | brasilia", "") == "()"
+    assert helper.parse_fact("I | favorite color", "") == "()"
+    assert helper.parse_fact("purple", "") == "()"
+
+
+def test_parse_fact_key_takes_subject_and_relation(helper):
+    assert helper.parse_fact_key("my | favorite color", "") == '("user" favorite_color)'
+    assert helper.parse_fact_key("my favorite_color", "") == "()"
+
+
+def test_fact_extraction_prompt_uses_only_the_latest_message_text(helper):
+    prompt = helper.fact_extraction_prompt("bob: hi | arturgontijo: My favorite color is blue.")
+    assert prompt.endswith("MESSAGE: My favorite color is blue.")
+    assert "FACT subject | relation | value" in prompt
+
+
+def test_extracted_facts_reads_fact_lines_and_fused_lines(helper):
+    assert helper.extracted_facts("FACT I | favorite color | blue\nFACT I | favorite food | pasta") == (
+        '("I | favorite color | blue" "I | favorite food | pasta")'
+    )
+    assert helper.extracted_facts('**FACT I | favorite color | "blue"**, FACT I | favorite food | pasta.') == (
+        '("I | favorite color | blue" "I | favorite food | pasta")'
+    )
+    assert helper.extracted_facts("My favorite color is blue. -> FACT I | favorite color | blue (about the speaker)") == (
+        '("I | favorite color | blue")'
+    )
+    assert helper.extracted_facts("NONE (a general rule, not about one thing)") == "()"
+
+
+def test_describe_facts_addresses_the_sender_as_you(helper):
+    facts = ('(("arturgontijo" favorite_color "blue") ("france" capital "paris") '
+             '("arturgontijo" lives_in "belo horizonte"))')
+    assert helper.describe_facts(facts, "arturgontijo: what is my favorite color?") == (
+        "your favorite color is blue; france's capital is paris; you live in belo horizonte."
+    )
+    assert helper.describe_facts('(("bob" is "tall"))', "bob: am I tall?") == "you are tall."
+    assert helper.describe_facts('(("bob" is "tall"))', "ana: is bob tall?") == "bob is tall."
+    assert helper.describe_facts(facts, "bob: what does arturgontijo like?").startswith(
+        "arturgontijo's favorite color is blue;"
+    )
+    assert helper.describe_facts("()", "bob: hi") == "none"
+
+
+def test_fact_query_keys_start_with_the_speaker_and_skip_stopwords(helper):
+    message = "bob: hi | arturgontijo: What_apostrophe_s my favorite color of all?"
+    assert helper.fact_query_keys(message, 3) == '("arturgontijo" "favorite" "color" "all")'
+    assert helper.fact_query_keys("no speaker here at all", 2) == '("speaker" "here")'
+
+
+def test_is_send_call_matches_only_a_top_level_send(helper):
+    assert helper.is_send_call('(send "No new user input.")')
+    assert not helper.is_send_call('(pin "send this later")')
+    assert not helper.is_send_call('(das-recall (send x))')
+    assert not helper.is_send_call('(sendx "a")')
+
+
+def test_fact_query_keys_look_up_names_before_other_words(helper):
+    assert helper.fact_query_keys("arturgontijo: How many people live in Divinópolis?", 3) == (
+        '("arturgontijo" "divinópolis" "people" "live")'
+    )
+
+
+def test_unknown_skill_only_matches_prose(helper):
+    parsed = helper.balance_parentheses("My favorite color is blue")
+    assert helper.unknown_skill_only(parsed) is True
+    assert "send skill followed by the reply" in helper.unknown_skill_reminder()
+
+
+def test_unknown_skill_only_keeps_a_real_send(helper):
+    parsed = helper.balance_parentheses("send Paris is the capital")
+    assert helper.unknown_skill_only(parsed) is False
+
+
 # --- normalize_string -----------------------------------------------------
 
 def test_normalize_string_decodes_bytes(helper):

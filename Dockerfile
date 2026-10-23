@@ -29,8 +29,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Build dependencies from source. Pin refs at build time for reproducibility.
-ARG PETTA_REPO=https://github.com/trueagi-io/PeTTa.git
-ARG PETTA_REF=v1.0.4
+ARG PETTA_REPO=https://github.com/ccgsnet/PeTTa.git
+ARG PETTA_REF=das-v1.0.4
 ARG FAISS_REPO=https://github.com/facebookresearch/faiss.git
 ARG FAISS_REF=v1.8.0
 ARG CHROMADB_REPO=https://github.com/patham9/petta_lib_chromadb.git

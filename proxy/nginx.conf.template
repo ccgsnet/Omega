@@ -74,6 +74,10 @@ http {
             proxy_ssl_server_name on;
             proxy_ssl_protocols TLSv1.2 TLSv1.3;
             proxy_http_version 1.1;
+            # Local models (Ollama) buffer the full completion before the
+            # response headers. The http-level 120s cuts that off.
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
         }
 
         # OpenClaw Gateway: inject Bearer token, upstream is set at container

@@ -8,6 +8,10 @@
 (= (commchannel) telegram)
 (= (memoryDirectory) (joinPath ((projectRootDirectory) "memory")))
 
+; Stand-ins for the channel send and another skill, so no message leaves the test.
+(= (send $msg) (SENT $msg))
+(= (test-echo $x) (ECHO $x))
+
 !(import! &self ./src/loop)
 
 !(test (progn
@@ -60,3 +64,10 @@
          (heartbeat 1)
          (get-state &test_heartbeat_counter))
        0)
+
+!(test (run-skill (sread "(send \"Hi there\")") True) (SENT "Hi there"))
+
+!(test (run-skill (sread "(send \"No new user input.\")") False)
+       (SEND_SKIPPED "no new or unanswered user message"))
+
+!(test (run-skill (sread "(test-echo \"x\")") False) (ECHO "x"))
