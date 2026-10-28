@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import unicodedata
 import urllib.request
 from collections import deque
 from datetime import datetime
@@ -246,6 +247,20 @@ def message_speaker(message):
 FACT_ARTICLES = {"a", "an", "the"}
 # A field that is only a placeholder means the model had no subject or value.
 FACT_PLACEHOLDERS = {"none", "unknown", "null", "n/a", "nobody", "nothing"}
+# Words that name a property rather than a stored value. Extraction often writes
+# "logo" for "its logo blue"; the value beside it in the message is what DAS holds.
+FACT_ATTRIBUTES = {
+    "logo", "color", "colour", "colors", "colours", "city", "origin", "name",
+    "year", "type", "kind", "size", "age", "job", "role", "eyes", "eye",
+    "hair", "jersey", "flag", "title", "position",
+}
+# A generic kind of thing, not a stored name. "LOOKUP Team A" must not also
+# spend a query slot on "team", which then leaves room for an unrelated index hit.
+FACT_KINDS = {
+    "team", "teams", "city", "cities", "person", "people", "player", "players",
+    "server", "servers", "club", "clubs", "company", "group", "family",
+    "country", "countries", "agent", "user",
+}
 # A relation that only says "this is a note" carries a sentence, not a fact.
 RELATION_PLACEHOLDERS = {"note", "notes", "noted", "fact", "facts", "info", "information", "memo", "remember", "said", "says"}
 # Longest subject, relation and value accepted, in words. A longer field means
@@ -316,14 +331,27 @@ def name_variants(key, message=""):
     """Spellings of a recall key to try against facts written by other agents.
 
     Omega lowercases concept names; other writers keep the user's spelling. The
-    key as written in the message and in Title Case cover the common cases.
+    key as written in the message and in Title Case cover the common cases. A
+    short key that is a word of a longer name ("team" in "Team A") also tries
+    that longer name, which is where the facts are stored.
     """
     key = normalize_string(key).strip()
-    variants = [key]
-    for spelling in (next((m.group(0) for m in [re.search(re.escape(key), _latest_text(message), re.IGNORECASE)] if m), ""),
-                     key.title()):
+    variants = []
+
+    def add(spelling):
         if spelling and spelling not in variants:
             variants.append(spelling)
+
+    add(key)
+    text = _latest_text(message)
+    if key:
+        for match in re.finditer(rf"(?i)(?<!\w){re.escape(key)}(?!\w)", text):
+            add(match.group(0))
+            # "team" in "Team A" also tries "Team A", where the facts are stored.
+            longer = re.match(r"(?:\s+[A-Z0-9][\w./@+-]*)+", text[match.end():])
+            if longer:
+                add(match.group(0) + longer.group(0))
+    add(key.title())
     return _strings(*variants)
 
 
@@ -367,6 +395,8 @@ FACT_EXTRACTION_PROMPT = (
     "FACT subject | relation | value\n"
     "subject: a named person or thing, or a kind of thing such as banana or human; at most 4 words, I for the speaker. "
     "relation: at most 3 words. value: at most 6 words.\n"
+    "For each lasting fact the speaker denies about one subject, or says is no longer so, write one line: "
+    "NOT subject | relation | value\n"
     "For each named person or thing the speaker asks about, write one line: LOOKUP name\n"
     "name: the person or thing, at most 4 words, I for the speaker.\n"
     "For a question about something that must meet several conditions at once, write one line: "
@@ -374,7 +404,9 @@ FACT_EXTRACTION_PROMPT = (
     "For a question about something that meets any one of several conditions, write one line: "
     "ANY value | value\n"
     "value: one word or number from the message that the thing must be related to, such as a color, "
-    "a place, a year or a name; never the kind of thing asked for (team, city, person); at most 3 values.\n"
+    "a place, a year or a name (blue, Lisbon, 2009); never the attribute it describes (logo, color, city, eyes) "
+    "and never the kind of thing asked for (team, city, person); at most 3 values. "
+    "'its logo blue' gives blue, not logo; 'green eyes' gives green, not eyes.\n"
     "Examples:\n"
     "My favorite color is blue. -> FACT I | favorite color | blue\n"
     "My sister Ana works at Acme as a designer. -> FACT Ana | works at | Acme\nFACT Ana | job | designer\n"
@@ -382,6 +414,8 @@ FACT_EXTRACTION_PROMPT = (
     "I moved to Lisbon last year. -> FACT I | lives in | Lisbon\n"
     "People from Oslo are tall and the Acme team is remote. -> FACT Oslo | people | tall\nFACT Acme team | work mode | remote\n"
     "Bananas are a fruit and dolphins are mammals. -> FACT banana | is a | fruit\nFACT dolphin | is a | mammal\n"
+    "Ana does not work at Acme. -> NOT Ana | works at | Acme\n"
+    "I no longer live in Lisbon, I moved to Porto. -> NOT I | lives in | Lisbon\nFACT I | lives in | Porto\n"
     "What is my favorite color? -> LOOKUP I\n"
     "When is the standup and who runs it? -> LOOKUP standup\n"
     "Tell me about Ana's job. -> LOOKUP Ana\n"
@@ -389,6 +423,8 @@ FACT_EXTRACTION_PROMPT = (
     "Who said people from Oslo are tall? -> LOOKUP Oslo\n"
     "Who lives in Lisbon and works at Acme? -> ALL Lisbon | Acme\n"
     "Which city is on the coast and hosted the 1992 games? -> ALL coast | 1992\n"
+    "Which player has green eyes and is from Oslo? -> ALL green | Oslo\n"
+    "Which team has its logo blue and is from Oslo? -> ALL blue | Oslo\n"
     "Which servers run Ubuntu or Debian? -> ANY Ubuntu | Debian\n"
     "Does Ana work at Acme and live in Lisbon? -> LOOKUP Ana\nALL Acme | Lisbon\n"
     "Servers with more than 64 GB are large. -> NONE (a rule with a condition, not a fact about one subject)\n"
@@ -396,7 +432,8 @@ FACT_EXTRACTION_PROMPT = (
     "A statement about the people, members or parts of a named thing is a fact about that thing. "
     "Every question that names a person or thing gets a LOOKUP line, whatever the topic. "
     "A question that joins conditions with and gets an ALL line, with or an ANY line, besides any LOOKUP. "
-    "Requests, commands and rules with a condition give nothing. If there is no FACT, LOOKUP, ALL or ANY, write NONE.\n"
+    "A NOT line names the fact being denied in its positive form, never a relation containing not. "
+    "Requests, commands and rules with a condition give nothing. If there is no FACT, NOT, LOOKUP, ALL or ANY, write NONE.\n"
     "MESSAGE: "
 )
 
@@ -444,14 +481,34 @@ def extracted_facts(reply):
     return _strings(*_extraction_entries(reply, "FACT"))
 
 
+def extracted_denials(reply):
+    """'subject | relation | value' strings from NOT entries: facts the speaker denies."""
+    return _strings(*_extraction_entries(reply, "NOT"))
+
+
+# The provider answers this when a reasoning model spends the whole output budget thinking.
+TOKEN_LIMIT_MARKER = "reasoning exceeded the token limit"
+
+
+def is_token_limit_reply(reply):
+    """True when an extraction reply is the provider's token-limit message rather than an answer."""
+    return TOKEN_LIMIT_MARKER in normalize_string(reply)
+
+
 def extracted_lookups(reply, message="", limit=3):
     """Concept names from LOOKUP entries of an extraction reply, the speaker for I/me/my.
 
     A name of several words such as "Oslo people" also gives each capitalised word
-    on its own, as the fact is most likely stored under "oslo". The values of an
-    ANY entry (a question joining conditions with or) are looked up the same way:
-    recall reads a name on both sides of a fact, so the union of their facts is
-    the OR of the conditions.
+    on its own, as the fact is most likely stored under "oslo". The subject of a
+    FACT or NOT line is looked up too: a statement names the thing in the fact
+    and often has no LOOKUP, so "Team A is playing…" still recalls Team A rather
+    than the previous keys. The values of an ANY entry (a question joining
+    conditions with or) are looked up the same way: recall reads a name on both
+    sides of a fact, so the union of their facts is the OR of the conditions.
+    The values of an ALL entry are looked up too, after the names: the
+    conjunction over them answers the question when the model named the right
+    values, and when it did not ("logo" for "blue"), the facts of each value
+    still name the candidates, whose other facts recall then reads.
     """
     speaker = message_speaker(message)
     names = []
@@ -469,10 +526,17 @@ def extracted_lookups(reply, message="", limit=3):
         if len(words) > 1:
             for word in words:
                 token = fact_token(word)
-                if word[0].isupper() and len(token) >= 3 and token not in FACT_STOPWORDS:
+                if (word[0].isupper() and len(token) >= 3 and token not in FACT_STOPWORDS
+                        and token not in FACT_KINDS):
                     add(token)
-    for value in _entry_values(reply, "ANY", message):
-        add(value)
+    for tag in ("FACT", "NOT"):
+        for entry in _extraction_entries(reply, tag):
+            fields = _fact_fields(entry, 3, message)
+            if fields:
+                add(fields[0])
+    for tag in ("ANY", "ALL"):
+        for value in _entry_values(reply, tag, message):
+            add(value)
     return _strings(*names[:int(limit)])
 
 
@@ -489,16 +553,34 @@ def _asked_kind(message):
     return {kind, kind[:-1] if kind.endswith("s") else kind + "s"}
 
 
+def _value_for_attribute(attr, message, kind, used):
+    """The stored value an attribute names in the message: 'logo' in 'its logo blue' is blue."""
+    skip = FACT_STOPWORDS | FACT_ATTRIBUTES | FACT_PLACEHOLDERS | FACT_SELF_WORDS | kind | set(used)
+    words = re.findall(r"\w+", _latest_text(message))
+    tokens = [fact_token(word) for word in words]
+    for i, token in enumerate(tokens):
+        if token != attr:
+            continue
+        for j in (i + 1, i - 1, i + 2, i - 2):
+            if 0 <= j < len(tokens) and tokens[j] not in skip and (len(tokens[j]) >= 3 or tokens[j].isdigit()):
+                return tokens[j]
+    return None
+
+
 def _entry_values(reply, tag, message=""):
     """The '|'-separated values of the first TAG entry with at least two of them, lowercase.
 
     The kind of thing asked for is not a value: "which team" gives no team.
+    An attribute the model named instead of the stored value ("logo" for
+    "its logo blue") is replaced by the neighboring word in the message.
     """
     kind = _asked_kind(message)
     for entry in _extraction_entries(reply, tag):
         values = []
         for field in _plain_text(entry).split("|"):
             value = " ".join(_fact_words(field))
+            if value in FACT_ATTRIBUTES:
+                value = _value_for_attribute(value, message, kind, values)
             if value and value not in FACT_PLACEHOLDERS and value not in kind and value not in values:
                 values.append(value)
         if len(values) >= 2:
@@ -563,7 +645,7 @@ def conjunction_queries(values, message=""):
                 clauses = [("$r1", first), ("$r2", second)]
                 pattern = "(, " + " ".join(f"(Evaluation (Predicate {r}) (List (Concept $s) (Concept {metta_string(v)})))"
                                            for r, v in clauses) + ")"
-                template = "(" + " ".join(f'($s {r} {metta_string(v)} "" "")' for r, v in clauses) + ")"
+                template = "(" + " ".join(f'($s {r} {metta_string(v)} "" "" 1.0)' for r, v in clauses) + ")"
                 pairs.append(f"({pattern} {template})")
     return f"({' '.join(pairs)})"
 
@@ -577,7 +659,7 @@ def conjunction_facts(facts, values, message=""):
     kept = [fact for subject_facts in by_subject.values()
             if all(any(_value_matches(fact[2], value, message) for fact in subject_facts) for value in wanted)
             for fact in subject_facts]
-    return "(" + " ".join(_strings(*fact) for fact in kept) + ")"
+    return _fact_list_text(kept)
 
 
 def fact_index_text(subject, relation, value):
@@ -595,15 +677,40 @@ def indexed_fact_subjects(results, limit=3):
     return _strings(*subjects[:int(limit)])
 
 
-def recall_keys(message, lookups, indexed, limit=3):
-    """Concept names besides the speaker to query for a message: LOOKUP names, then index
-    hits, then capitalised message words when the extraction gave no LOOKUP; at most limit."""
+def _folded_name(name):
+    """Lowercase name without combining marks, so brasilia and brasília compare equal."""
+    return "".join(c for c in unicodedata.normalize("NFD", str(name).lower())
+                   if unicodedata.category(c) != "Mn")
+
+
+def recall_keys(message, lookups, indexed, limit=3, previous="()"):
+    """Concept names besides the speaker to query for a message.
+
+    LOOKUP names come first. An indexed FACT subject is added only as a spelling
+    of a LOOKUP (brasília for brasilia), never an unrelated name: the nearest
+    document after learning about Team B is Team B, which must not replace a
+    question about Team A. Capitalised message words fill in when extraction
+    named nothing. A follow-up that names nothing ('Try again') keeps the
+    previous keys instead of that nearest document.
+    """
     speaker = message_speaker(message)
-    names = []
     lookups = re.findall(r'"([^"]*)"', str(lookups or ""))
     indexed = re.findall(r'"([^"]*)"', str(indexed or ""))
-    fallback = [] if lookups else re.findall(r'"([^"]*)"', fact_query_keys(message, limit, names_only=True))
-    for name in lookups + indexed + fallback:
+    previous = re.findall(r'"([^"]*)"', str(previous or ""))
+    fallback = [] if lookups else [name for name in re.findall(r'"([^"]*)"', fact_query_keys(message, limit, names_only=True))
+                                   if name and name != speaker]
+    folded = {_folded_name(name) for name in lookups}
+    extra_index = [name for name in indexed if _folded_name(name) in folded]
+    if lookups:
+        pool = lookups + extra_index
+    elif fallback:
+        pool = fallback + indexed
+    elif previous and not _latest_text(message).endswith("?"):
+        pool = previous
+    else:
+        pool = indexed
+    names = []
+    for name in pool:
         if name and name != speaker and name not in names and len(names) < int(limit):
             names.append(name)
     return _strings(*names)
@@ -617,7 +724,18 @@ def _second_person(verb):
     return SECOND_PERSON_VERBS.get(verb, verb[:-1] if verb.endswith("s") and verb != "is" else verb)
 
 
-def _fact_sentence(subject, relation, value, speaker):
+def _negated(verb):
+    """'is' -> 'is not', 'has' -> 'does not have', 'likes' -> 'does not like', 'like' -> 'do not like'."""
+    if verb in ("is", "are"):
+        return f"{verb} not"
+    if verb == "has":
+        return "does not have"
+    if verb.endswith("s"):
+        return f"does not {_second_person(verb)}"
+    return f"do not {verb}"
+
+
+def _fact_sentence(subject, relation, value, speaker, denied=False):
     relation, value = relation.replace("_", " "), value.replace("_", " ")
     words = relation.split()
     # "population is" reads as "population is is" once the sentence adds its own verb.
@@ -626,10 +744,11 @@ def _fact_sentence(subject, relation, value, speaker):
     verb, _, rest = relation.partition(" ")
     if verb in FACT_VERB_RELATIONS:
         if subject == speaker:
-            return " ".join(part for part in ("you", _second_person(verb), rest, value) if part)
-        return f"{subject} {relation} {value}"
+            verb = _second_person(verb)
+            return " ".join(part for part in ("you", _negated(verb) if denied else verb, rest, value) if part)
+        return " ".join(part for part in (subject, _negated(verb) if denied else verb, rest, value) if part)
     owner = "your" if subject == speaker else f"{subject}'s"
-    return f"{owner} {relation} is {value}"
+    return f"{owner} {relation} {'is not' if denied else 'is'} {value}"
 
 
 def _fact_source(who, when, speaker):
@@ -640,30 +759,120 @@ def _fact_source(who, when, speaker):
 
 
 def _fact_tuples(facts):
-    """Recall tuples in a MeTTa list as (subject, relation, value, who, when), who and when empty when absent.
+    """Recall tuples in a MeTTa list as (subject, relation, value, who, when, strength).
 
-    The relation is accepted quoted or as a bare symbol, which older stored facts used.
+    A tuple is ("subject" "relation" "value"), with its source
+    ("subject" "relation" "value" "who" "when"), or with its truth as well
+    ("subject" "relation" "value" "who" "when" 1.0); who and when are empty and
+    the strength 1.0 when absent. A strength under 0.5 is a denied fact. The
+    relation is accepted quoted or as a bare symbol, which older stored facts used.
     """
-    found = re.findall(r'\(\s*"([^"]*)"\s+(?:"([^"]*)"|([^\s()"]+))\s+"([^"]*)"(?:\s+"([^"]*)"\s+"([^"]*)")?\s*\)',
+    found = re.findall(r'\(\s*"([^"]*)"\s+(?:"([^"]*)"|([^\s()"]+))\s+"([^"]*)"'
+                       r'(?:\s+"([^"]*)"\s+"([^"]*)"(?:\s+([0-9.eE+-]+))?)?\s*\)',
                        str(facts or ""))
-    return [(s, quoted or bare, v, who, when) for s, quoted, bare, v, who, when in found]
+    return [(s, quoted or bare, v, who, when, _strength(strength)) for s, quoted, bare, v, who, when, strength in found]
+
+
+def _strength(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _denied(fact):
+    return fact[5] < 0.5
+
+
+def _fact_tuple_text(fact):
+    """A recall tuple as MeTTa text, the strength unquoted."""
+    subject, relation, value, who, when, strength = fact
+    return f"({' '.join(metta_string(t) for t in (subject, relation, value, who, when))} {float(strength)!r})"
+
+
+def _fact_list_text(facts):
+    return "(" + " ".join(_fact_tuple_text(fact) for fact in facts) + ")"
+
+
+def merge_facts(facts):
+    """Recalled tuples without the sourceless copy of a fact that also came with its source.
+
+    A learned fact answers both the Belief/Stated query, with who, when and
+    truth, and the bare Evaluation query, with none; the bare copy would read a
+    denied fact as true. Order is kept, duplicates dropped.
+    """
+    tuples = _fact_tuples(facts)
+    sourced = {fact[:3] for fact in tuples if fact[3]}
+    kept = []
+    for fact in tuples:
+        if (fact[3] or fact[:3] not in sourced) and fact not in kept:
+            kept.append(fact)
+    return _fact_list_text(kept)
+
+
+def fact_subjects(facts):
+    """The distinct subjects of recall tuples, as ("Team A" "team b")."""
+    subjects = []
+    for fact in _fact_tuples(facts):
+        if fact[0] not in subjects:
+            subjects.append(fact[0])
+    return _strings(*subjects)
+
+
+def new_subjects(facts, keys, speaker="", limit=3):
+    """Subjects of recall tuples that were not looked up themselves, spelled as stored.
+
+    A fact found from its value side, "Team A founded_in Brasília" for the key
+    "brasília", names a thing the message did not: its other facts (Team A's
+    logo color) are what answers "which team from Brasília has a blue logo", so
+    recall reads them next. Subjects equal to a key or to the speaker are already
+    read in full. At most limit subjects, in the order found; a subject another
+    agent stored with capitals ("Team A") is given lowercase as well, which is
+    how the facts learned here about it are stored.
+    """
+    known = {str(k).lower() for k in re.findall(r'"([^"]*)"', str(keys or ""))}
+    known.add(str(speaker or "").lower())
+    subjects = []
+    for fact in _fact_tuples(facts):
+        subject = fact[0]
+        if subject and subject.lower() not in known and subject.lower() not in (s.lower() for s in subjects):
+            subjects.append(subject)
+    names = []
+    for subject in subjects[:int(limit)]:
+        for name in (subject, subject.lower()):
+            if name not in names:
+                names.append(name)
+    return _strings(*names)
+
+
+def drop_denied(facts, beliefs):
+    """Recall tuples without those whose fact is believed false.
+
+    beliefs are ("subject" "relation" "value" strength) tuples read from the
+    Belief links of the facts' subjects.
+    """
+    denied = {(s, r, v) for s, r, v, strength in re.findall(r'\(\s*"([^"]*)"\s+"([^"]*)"\s+"([^"]*)"\s+([0-9.eE+-]+)\s*\)',
+                                                              str(beliefs or ""))
+              if _strength(strength) < 0.5}
+    return _fact_list_text([fact for fact in _fact_tuples(facts) if fact[:3] not in denied])
 
 
 def describe_facts(facts, message=""):
     """Recalled facts as sentences addressed to the message sender.
 
     A fact is ("subject" relation "value") or, with its provenance,
-    ("subject" relation "value" "who" "when"); the source is kept so the agent
-    can say who told it what, and when. The newest facts come first, so when
-    a relation holds several values the latest statement is read first.
+    ("subject" relation "value" "who" "when") and its truth; the source is kept
+    so the agent can say who told it what, and when, and a denied fact reads
+    "is not". The newest facts come first, so when a relation holds several
+    values the latest statement is read first.
     """
     speaker = message_speaker(message)
     found = _fact_tuples(facts)
     if not found:
         return "none"
     found.sort(key=lambda fact: fact[4], reverse=True)
-    return "; ".join(_fact_sentence(subject, relation, value, speaker) + _fact_source(who, when, speaker)
-                     for subject, relation, value, who, when in found) + "."
+    return "; ".join(_fact_sentence(subject, relation, value, speaker, denied=_denied(fact)) + _fact_source(who, when, speaker)
+                     for fact in found for subject, relation, value, who, when, _ in [fact]) + "."
 
 
 def fact_query_keys(message, limit=3, names_only=False):

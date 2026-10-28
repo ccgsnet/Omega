@@ -61,15 +61,20 @@
 ; Chroma is the similarity index over the facts in DAS: a new fact is stored as
 ; the document "FACT subject | relation | value", and a message's nearest FACT
 ; documents give the subjects to query in DAS. DAS stays the source of truth,
-; so a document whose fact was unlearned only costs one empty query.
+; so a document whose fact was unlearned only costs one empty query. A denied
+; fact is indexed the same way: the document only leads to the subject, and
+; DAS holds the truth.
 (= (index-fact $learned)
    (case $learned
-     (((LEARNED $s $r $v)
-       (das-log-failure FACT_NOT_INDEXED
-         (catch (let $doc (py-call (helper.fact_index_text $s $r $v))
-                  (progn (py-call (lib_chromadb.remember $doc (embed $doc) (get_time_as_string)))
-                         (INDEXED $s $r $v))))))
+     (((LEARNED $s $r $v) (index-fact-document $s $r $v))
+      ((DENIED $s $r $v) (index-fact-document $s $r $v))
       ($other $other))))
+
+(= (index-fact-document $s $r $v)
+   (das-log-failure FACT_NOT_INDEXED
+     (catch (let $doc (py-call (helper.fact_index_text $s $r $v))
+              (progn (py-call (lib_chromadb.remember $doc (embed $doc) (get_time_as_string)))
+                     (INDEXED $s $r $v))))))
 
 (= (indexed-fact-keys $msg $limit)
    (case (catch (py-call (helper.indexed_fact_subjects (repr (query $msg)) $limit)))

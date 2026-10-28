@@ -72,7 +72,7 @@
 
 ; Recalled facts carry who stated them and when; the time is dropped for comparison.
 (= (without-time $facts)
-   (map-atom $facts $fact (let ($s $r $v $who $when) $fact ($s $r $v $who))))
+   (map-atom $facts $fact (let ($s $r $v $who $when $f) $fact ($s $r $v $who))))
 
 !(test (learn "I | favorite_color | purple")
        (LEARNED "arturgontijo" "favorite_color" "purple"))
@@ -134,19 +134,18 @@
          (das-store "(Evaluation (Predicate \"championship_victories\") (List (Concept \"Team B\") (Concept \"2022\") (Concept \"17\")))")
          (das-store "(Evaluation (Predicate \"founded_in\") (List (Concept \"Team C\") (Concept \"Divinópolis\")))")
          (recall-facts-by-keys ("team b")))
-       (("Team B" "jersey_color" "red" "" "") ("Team B" "championship_victories" "2022 17" "" "")))
+       (("Team B" "jersey_color" "red" "" "" 1.0) ("Team B" "championship_victories" "2022 17" "" "" 1.0)))
 !(test (recall-facts-by-keys ("divinópolis"))
-       (("Team C" "founded_in" "Divinópolis" "" "")))
+       (("Team C" "founded_in" "Divinópolis" "" "" 1.0)))
 !(test (== (describe-facts (recall-facts-by-keys ("team b")) "ana: What do you know about Team B?")
            (py-call (helper.normalize_string "Team B's jersey color is red; Team B's championship victories is 2022 17.")))
        True)
-; A Stated fact under the same key takes precedence and the bare form is not queried;
-; a three-place Stated record written by another agent is read as one value.
+; A name with facts learned here and facts loaded by another agent gives both:
+; the learned one with its source, the others without.
 !(test (progn
          (learn "Team B | supporters | 90000")
-         (das-store "(Stated (Evaluation (Predicate \"championship_defeats\") (List (Concept \"team b\") (Concept \"2022\") (Concept \"8\"))) \"bob\" \"2026-10-27 21:53:29\")")
          (without-time (recall-facts-by-keys ("team b"))))
-       (("team b" "supporters" "90000" "ana") ("team b" "championship_defeats" "2022 8" "bob")))
+       (("team b" "supporters" "90000" "ana") ("Team B" "jersey_color" "red" "") ("Team B" "championship_victories" "2022 17" "")))
 !(change-state! &prevmsg "arturgontijo: My favorite color is purple")
 
 ; AND and OR queries over facts through the metta skill, as the skill hints show them.
@@ -173,17 +172,17 @@
          (das-store "(Evaluation (Predicate \"inherits_from\") (List (Concept \"monkey\") (Concept \"mammal\")))")
          (das-store "(Evaluation (Predicate \"inherits_from\") (List (Concept \"chimp\") (Concept \"mammal\")))")
          (conjunction-facts (sread (py-call (helper.extracted_conjunction "LOOKUP monkey\nALL monkey | chimp" (current-message))))))
-       (("human" "similar_to" "monkey" "" "") ("human" "similar_to" "chimp" "" "")))
+       (("human" "similar_to" "monkey" "" "" 1.0) ("human" "similar_to" "chimp" "" "" 1.0)))
 !(test (conjunction-facts ("mammal" "chimp")) ())
 !(test (progn
          (das-store "(Evaluation (Predicate \"similar_to\") (List (Concept \"monkey\") (Concept \"Human\")))")
          (change-state! &prevmsg "ana: Who inherits from mammal and is similar to Human?")
          (conjunction-facts ("mammal" "human")))
-       (("monkey" "inherits_from" "mammal" "" "") ("monkey" "similar_to" "Human" "" "")))
+       (("monkey" "inherits_from" "mammal" "" "" 1.0) ("monkey" "similar_to" "Human" "" "" 1.0)))
 !(test (progn
          (das-store "(Evaluation (Predicate \"lives_in\") (List (Concept \"monkey\") (Concept \"jungle\")))")
          (conjunction-facts ("mammal" "human" "jungle")))
-       (("monkey" "inherits_from" "mammal" "" "") ("monkey" "similar_to" "Human" "" "") ("monkey" "lives_in" "jungle" "" "")))
+       (("monkey" "inherits_from" "mammal" "" "" 1.0) ("monkey" "similar_to" "Human" "" "" 1.0) ("monkey" "lives_in" "jungle" "" "" 1.0)))
 !(test (conjunction-facts ("mammal" "human" "sea")) ())
 !(test (conjunction-facts ()) ())
 !(change-state! &prevmsg "arturgontijo: My favorite color is purple")
@@ -223,6 +222,69 @@
 
 !(test (learn-all "NONE")
        ())
+
+; A denied fact is the same term believed false, with its source. Denying a
+; stated value replaces it and leaves the relation's other values; stating it
+; again replaces the denial. Recall reads the denial as "is not", and the
+; conjunction does not count a denied fact as meeting its condition.
+!(change-state! &prevmsg "bob: Team B is not playing the 2026 championship.")
+!(test (learn-all "FACT Team A | is playing | 2026 championship\nNOT Team B | is playing | 2026 championship")
+       ((LEARNED "team a" "is_playing" "2026 championship") (DENIED "team b" "is_playing" "2026 championship")))
+!(test (deny "Team B | is playing | 2026 championship")
+       (KNOWN "team b" "is_playing" "2026 championship"))
+!(test (== (beliefs "(Evaluation (Predicate \"is_playing\") (List (Concept \"team b\") $1))")
+           (sread "(((Evaluation (Predicate \"is_playing\") (List (Concept \"team b\") (Concept \"2026 championship\"))) (stv 0.0 0.9)))"))
+       True)
+!(test (map-atom (recall-facts-by-keys ("2026 championship")) $fact (let ($s $r $v $who $when $f) $fact ($s $v $f)))
+       (("team a" "2026 championship" 1.0) ("team b" "2026 championship" 0.0)))
+!(test (== (describe-facts (("team b" "is_playing" "2026 championship" "bob" "" 0.0)) "bob: Is Team B playing the 2026 championship?")
+           (py-call (helper.normalize_string "team b is not playing 2026 championship (said by you).")))
+       True)
+!(test (progn
+         (learn "Team B | is playing | 2027 championship")
+         (learn "Team B | is playing | 2026 championship")
+         (relation-truths "team b" "is_playing"))
+       (("2027 championship" 1.0) ("2026 championship" 1.0)))
+!(test (progn
+         (deny "Team B | is playing | 2026 championship")
+         (relation-truths "team b" "is_playing"))
+       (("2027 championship" 1.0) ("2026 championship" 0.0)))
+!(test (progn
+         (das-store "(Evaluation (Predicate \"is_playing\") (List (Concept \"team b\") (Concept \"2026 championship\")))")
+         (das-store "(Evaluation (Predicate \"is_playing\") (List (Concept \"team b\") (Concept \"2027 championship\")))")
+         (das-store "(Evaluation (Predicate \"jersey_color\") (List (Concept \"team b\") (Concept \"red\")))")
+         (conjunction-facts ("red" "2026 championship")))
+       ())
+!(test (conjunction-facts ("red" "2027 championship"))
+       (("team b" "jersey_color" "red" "" "" 1.0) ("team b" "is_playing" "2027 championship" "" "" 1.0)))
+
+; A fact found from its value side names a subject the message did not; the
+; rest of that subject's facts are read, as stored and lowercase, and subjects
+; that were keys or the sender are not read again.
+!(change-state! &prevmsg "arturgontijo: Which team has its logo blue and is from Brasília?")
+!(test (progn
+         (das-store "(Evaluation (Predicate \"founded_in\") (List (Concept \"Team A\") (Concept \"Brasília\")))")
+         (das-store "(Evaluation (Predicate \"logo_color\") (List (Concept \"Team A\") (Concept \"blue\")))")
+         (learn "Team A | coach | Ana")
+         (let $facts (recall-facts-by-keys ("logo" "brasília"))
+           (let $more (expand-subjects $facts ("logo" "brasília") "arturgontijo")
+             ($facts (sread (py-call (helper.new_subjects (repr $facts) (repr ("logo" "brasília")) "arturgontijo" 3)))
+                     (without-time $more)))))
+       ((("Team A" "founded_in" "Brasília" "" "" 1.0))
+        ("Team A" "team a")
+        (("Team A" "founded_in" "Brasília" "") ("Team A" "logo_color" "blue" "")
+         ("team a" "is_playing" "2026 championship" "bob") ("team a" "coach" "ana" "arturgontijo"))))
+!(test (expand-subjects (("Team A" "founded_in" "Brasília" "" "" 1.0) ("arturgontijo" "likes" "tea" "arturgontijo" "" 1.0))
+                        ("team a") "arturgontijo")
+       ())
+!(test (== (describe-facts (sread (py-call (helper.merge_facts (repr (("Team A" "founded_in" "Brasília" "" "" 1.0)
+                                                                       ("Team A" "founded_in" "Brasília" "" "" 1.0)
+                                                                       ("Team A" "logo_color" "blue" "" "" 1.0))))))
+                           (current-message))
+           (py-call (helper.normalize_string "Team A's founded in is Brasília; Team A's logo color is blue.")))
+       True)
+!(unlearn "Team A | coach")
+!(change-state! &prevmsg "arturgontijo: My favorite color is purple")
 
 !(test (progn
          (learn-all "FACT Brazil | capital | Brasília")

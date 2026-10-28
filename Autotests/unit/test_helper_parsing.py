@@ -315,6 +315,25 @@ def test_any_values_are_looked_up_like_names_and_all_values_make_a_conjunction(h
     assert helper.extracted_conjunction("ALL team | blue | 2009 championship", message) == '("blue" "2009 championship")'
     assert helper.extracted_lookups("ANY teams | red | blue", "bob: Which team has red or blue jerseys?") == '("red" "blue")'
     assert "ALL value | value" in helper.FACT_EXTRACTION_PROMPT and "ANY value | value" in helper.FACT_EXTRACTION_PROMPT
+    # The model often names the attribute ("logo") instead of the stored value ("blue").
+    message = "bob: Which team has its logo blue and is from Brasília?"
+    assert helper.extracted_conjunction("ALL logo | Brasília", message) == '("blue" "brasília")'
+    assert helper.extracted_lookups("ALL logo | Brasília", message) == '("blue" "brasília")'
+    assert helper.extracted_conjunction("ALL red | Brasília",
+                                        "bob: Which team has its logo red and is from Brasília?") == '("red" "brasília")'
+    assert helper.extracted_conjunction("ALL eyes | Oslo", "bob: Which player has green eyes and is from Oslo?") == (
+        '("green" "oslo")')
+    assert helper.extracted_lookups("LOOKUP Ana\nALL Acme | Lisbon", "bob: q?", 2) == '("ana" "acme")'
+
+
+def test_new_subjects_are_those_recalled_from_the_value_side(helper):
+    facts = ('(("Team A" "founded_in" "Brasília" "" "" 1.0) ("bob" "likes" "tea" "bob" "2026-10-27 10:00:00" 1.0)'
+             ' ("team b" "founded_in" "Divinópolis" "" "" 1.0) ("Team A" "logo_color" "blue" "" "" 1.0)'
+             ' ("iPad" "owner" "ana" "" "" 1.0) ("Club C" "city" "Brasília" "" "" 1.0))')
+    assert helper.new_subjects(facts, '("brasília" "team b")', "bob") == '("Team A" "team a" "iPad" "ipad" "Club C" "club c")'
+    assert helper.new_subjects(facts, '("brasília" "team b")', "bob", 1) == '("Team A" "team a")'
+    assert helper.new_subjects(facts, '("Team A" "ipad" "club c" "team b")', "bob") == "()"
+    assert helper.new_subjects("()", '("x")', "bob") == "()"
 
 
 def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(helper):
@@ -322,7 +341,7 @@ def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(he
     assert helper.conjunction_queries('("blue" "2009")', message) == (
         '(((, (Evaluation (Predicate $r1) (List (Concept $s) (Concept "blue")))'
         ' (Evaluation (Predicate $r2) (List (Concept $s) (Concept "2009"))))'
-        ' (($s $r1 "blue" "" "") ($s $r2 "2009" "" ""))))'
+        ' (($s $r1 "blue" "" "" 1.0) ($s $r2 "2009" "" "" 1.0))))'
     )
     # A value spelled with capitals in the message is tried that way too; a third value pairs with the first.
     queries = helper.conjunction_queries('("lisbon" "acme" "tea")', "bob: Who lives in Lisbon, works at Acme and likes tea?")
@@ -338,22 +357,79 @@ def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(he
 
 
 def test_conjunction_facts_keep_only_subjects_related_to_every_value(helper):
-    facts = ('(("Team A" "logo_color" "blue" "" "") ("Team A" "won_national_championship" "2009" "" "")'
-             ' ("Team B" "jersey_color" "blue" "" "") ("Team B" "founded_year" "1982" "" ""))')
-    assert helper.conjunction_facts(facts, '("blue" "2009")') == (
-        '(("Team A" "logo_color" "blue" "" "") ("Team A" "won_national_championship" "2009" "" ""))'
-    )
+    facts = ('(("Team A" "logo_color" "blue" "" "" 1.0) ("Team A" "won_national_championship" "2009" "" "" 1.0)'
+             ' ("Team B" "jersey_color" "blue" "" "" 1.0) ("Team B" "founded_year" "1982" "" "" 1.0))')
+    team_a = '(("Team A" "logo_color" "blue" "" "" 1.0) ("Team A" "won_national_championship" "2009" "" "" 1.0))'
+    assert helper.conjunction_facts(facts, '("blue" "2009")') == team_a
     # The message spelling and a word of a longer value count as the same value.
-    assert helper.conjunction_facts('(("ana" "lives_in" "Lisbon" "" "") ("ana" "works_at" "acme" "" ""))',
-                                    '("lisbon" "acme")') == '(("ana" "lives_in" "Lisbon" "" "") ("ana" "works_at" "acme" "" ""))'
-    assert helper.conjunction_facts(facts, '("blue" "2009 championship")', "bob: who won the 2009 championship?") == (
-        '(("Team A" "logo_color" "blue" "" "") ("Team A" "won_national_championship" "2009" "" ""))'
-    )
+    assert helper.conjunction_facts('(("ana" "lives_in" "Lisbon" "" "" 1.0) ("ana" "works_at" "acme" "" "" 1.0))',
+                                    '("lisbon" "acme")') == (
+        '(("ana" "lives_in" "Lisbon" "" "" 1.0) ("ana" "works_at" "acme" "" "" 1.0))')
+    assert helper.conjunction_facts(facts, '("blue" "2009 championship")', "bob: who won the 2009 championship?") == team_a
     assert helper.conjunction_facts(facts, '("blue" "1982")') == (
-        '(("Team B" "jersey_color" "blue" "" "") ("Team B" "founded_year" "1982" "" ""))'
+        '(("Team B" "jersey_color" "blue" "" "" 1.0) ("Team B" "founded_year" "1982" "" "" 1.0))'
     )
     assert helper.conjunction_facts(facts, '("blue" "2022")') == "()"
     assert helper.conjunction_facts("()", '("blue" "2009")') == "()"
+    # Tuples without a strength (older callers) are read as believed true.
+    assert helper.conjunction_facts('(("x" "a" "blue" "" "") ("x" "b" "2009" "" ""))', '("blue" "2009")') == (
+        '(("x" "a" "blue" "" "" 1.0) ("x" "b" "2009" "" "" 1.0))'
+    )
+
+
+def test_denials_are_extracted_and_a_denied_fact_is_described_as_not_so(helper):
+    reply = "FACT Team A | is playing | 2026 championship\nNOT Team B | is playing | 2026 championship\nNOT none | x | y"
+    assert helper.extracted_facts(reply) == '("Team A | is playing | 2026 championship")'
+    assert helper.extracted_denials(reply) == '("Team B | is playing | 2026 championship" "none | x | y")'
+    assert helper.extracted_denials("NONE") == "()"
+    assert "NOT subject | relation | value" in helper.FACT_EXTRACTION_PROMPT
+    facts = ('(("team b" "is_playing" "2026 championship" "bob" "2026-10-27 23:00:00" 0.0) '
+             '("bob" "likes" "tea" "bob" "2026-10-27 22:00:00" 0.0) '
+             '("bob" "favorite_color" "blue" "bob" "2026-10-27 21:00:00" 0.0) '
+             '("bob" "has" "dog" "bob" "2026-10-27 20:00:00" 0.0) '
+             '("bob" "lives_in" "porto" "bob" "2026-10-27 19:00:00" 0.0) '
+             '("bob" "lives_in" "lisbon" "bob" "2026-10-27 18:00:00" 1.0))')
+    assert helper.describe_facts(facts, "bob: where do I live?") == (
+        "team b is not playing 2026 championship (said by you on 2026-10-27 23:00:00); "
+        "you do not like tea (said by you on 2026-10-27 22:00:00); "
+        "your favorite color is not blue (said by you on 2026-10-27 21:00:00); "
+        "you do not have dog (said by you on 2026-10-27 20:00:00); "
+        "you do not live in porto (said by you on 2026-10-27 19:00:00); "
+        "you live in lisbon (said by you on 2026-10-27 18:00:00)."
+    )
+    assert helper.describe_facts('(("Team B" "jersey_color" "red" "" "" 0.0))', "ana: hi") == (
+        "Team B's jersey color is not red."
+    )
+
+
+def test_merge_facts_prefers_the_sourced_copy_of_a_fact(helper):
+    facts = ('(("Team B" "jersey_color" "red" "" "" 1.0) ("team b" "supporters" "90000" "ana" "2026-10-27 10:00:00" 1.0)'
+             ' ("team b" "supporters" "90000" "" "" 1.0) ("Team B" "jersey_color" "red" "" "" 1.0)'
+             ' ("team b" "is_playing" "2026 championship" "" "" 1.0)'
+             ' ("team b" "is_playing" "2026 championship" "bob" "2026-10-27 11:00:00" 0.0))')
+    assert helper.merge_facts(facts) == (
+        '(("Team B" "jersey_color" "red" "" "" 1.0) ("team b" "supporters" "90000" "ana" "2026-10-27 10:00:00" 1.0)'
+        ' ("team b" "is_playing" "2026 championship" "bob" "2026-10-27 11:00:00" 0.0))'
+    )
+    assert helper.merge_facts("()") == "()"
+
+
+def test_drop_denied_removes_facts_the_speaker_denied(helper):
+    facts = ('(("team b" "jersey_color" "red" "" "" 1.0) ("team b" "is_playing" "2026 championship" "" "" 1.0)'
+             ' ("team a" "is_playing" "2026 championship" "" "" 1.0))')
+    assert helper.fact_subjects(facts) == '("team b" "team a")'
+    beliefs = '(("team b" "is_playing" "2026 championship" 0.0) ("team a" "is_playing" "2026 championship" 1.0))'
+    assert helper.drop_denied(facts, beliefs) == (
+        '(("team b" "jersey_color" "red" "" "" 1.0) ("team a" "is_playing" "2026 championship" "" "" 1.0))'
+    )
+    assert helper.drop_denied(facts, "()") == facts
+
+
+def test_is_token_limit_reply_recognises_the_provider_message(helper):
+    assert helper.is_token_limit_reply(
+        '(send "The agent didn\'t return an answer: reasoning exceeded the token limit (4000 tokens).")')
+    assert not helper.is_token_limit_reply("FACT I | likes | tea")
+    assert not helper.is_token_limit_reply("NONE")
 
 
 def test_needs_fact_extraction_skips_commands_and_short_acknowledgements(helper):
@@ -385,6 +461,20 @@ def test_recall_keys_prefer_lookups_then_index_then_words(helper):
     assert helper.recall_keys("bob: How can we classify Divinópolis city?", "()", "()", 3) == '("divinópolis")'
     assert helper.recall_keys("bob: Remind me what laptop I ordered. Ana knows.", "()", "()", 3) == '("ana")'
     assert helper.recall_keys("no sender here", '("x" "y")', "()", 1) == '("x")'
+    # An indexed fact about someone else must not replace the name the question asked.
+    about_a = "arturgontijo: What do you know about Team A?"
+    assert helper.recall_keys(about_a, '("team a")', '("team b")', 3) == '("team a")'
+    assert helper.extracted_lookups("LOOKUP Team A", about_a) == '("team a")'
+    # A follow-up that names nothing keeps the previous keys, not the last learned fact.
+    assert helper.recall_keys("arturgontijo: Try again", "()", '("team b")', 3, '("team a")') == '("team a")'
+    # A new question that names nothing still uses the index (fuzzy recall).
+    assert helper.recall_keys("bob: who is poor?", "()", '("divinópolis")', 3, '("team a")') == '("divinópolis")'
+    # A statement has a FACT and no LOOKUP; its subject is the key, not the previous turn's.
+    stated = "arturgontijo: Team A is playing the 2026 championship."
+    assert helper.extracted_lookups("FACT Team A | is playing | 2026 championship", stated) == '("team a")'
+    assert helper.extracted_lookups("NOT Team B | plays in | 2026 championship",
+                                    "arturgontijo: Team B is not playing the 2026 championship.") == '("team b")'
+    assert helper.recall_keys(stated, '("team a")', '("team b")', 3, '("team b")') == '("team a")'
 
 
 def test_parse_fact_drops_the_copula_of_a_longer_relation(helper):
@@ -405,6 +495,7 @@ def test_describe_facts_lists_the_newest_fact_first(helper):
 
 def test_name_variants_add_the_message_spelling_and_title_case(helper):
     assert helper.name_variants("team b", "ana: What do you know about Team B?") == '("team b" "Team B")'
+    assert helper.name_variants("team", "ana: What do you know about Team A?") == '("team" "Team" "Team A")'
     assert helper.name_variants("ipad", "ana: Who owns the iPad?") == '("ipad" "iPad" "Ipad")'
     assert helper.name_variants("divinópolis", "") == '("divinópolis" "Divinópolis")'
     assert helper.join_values("2022", "17") == '"2022 17"'

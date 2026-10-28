@@ -129,6 +129,8 @@ class AIProvider(AbstractAIProvider):
         self._model_name = model_name
         self._base_url = base_url
         self._client = None  # lazy initialization
+        # Whether the server accepts reasoning_effort; cleared on the first rejection.
+        self._reasoning_accepted = True
 
     def _ensure_client(self):
         """Initialize client on first use."""
@@ -175,12 +177,7 @@ class AIProvider(AbstractAIProvider):
             raise RuntimeError(f"{self.name} not configured (set {self._var_name})")
 
         try:
-            response = self._client.chat.completions.create(
-                model=self._model_name,
-                messages=self._build_messages(content),
-                max_tokens=max_tokens,
-                **kwargs
-            )
+            response = self._create_completion(content, max_tokens, reasoning, kwargs)
 
             raw = response.choices[0].message.content or ""
             finish_reason = getattr(response.choices[0], "finish_reason", None)
@@ -195,6 +192,27 @@ class AIProvider(AbstractAIProvider):
         except Exception as e:
             logger.exception(f"[AIProvider.chat]: Exception while communicating with LLM: {e}")
             return ""
+
+    def _create_completion(self, content: str, max_tokens: int, reasoning: str, kwargs: Dict[str, Any]):
+        """Chat Completions call with the reasoning effort passed as reasoning_effort.
+
+        Ollama and the OpenAI reasoning models take it ("none" turns thinking off
+        on Ollama); a server that rejects the parameter gets the request again
+        without it, and is not asked again.
+        """
+        request = dict(model=self._model_name, messages=self._build_messages(content),
+                       max_tokens=max_tokens, **kwargs)
+        effort = str(reasoning or "").strip().lower()
+        # OpenRouter already carries the effort in extra_body["reasoning"].
+        already_set = "reasoning_effort" in request or "reasoning" in (request.get("extra_body") or {})
+        if effort and self._reasoning_accepted and not already_set:
+            try:
+                return self._client.chat.completions.create(reasoning_effort=effort, **request)
+            except openai.BadRequestError as e:
+                logger.warning(f"[AIProvider._create_completion]: {self._model_name} rejected reasoning_effort={effort}, "
+                               f"retrying without it: {e}")
+                self._reasoning_accepted = False
+        return self._client.chat.completions.create(**request)
 
     def _clean_text(self, text: str) -> str:
         """Unescape special characters."""

@@ -20,7 +20,7 @@
 
 ; Recalled facts carry who stated them and when; the time is dropped for comparison.
 (= (without-time $facts)
-   (map-atom $facts $fact (let ($s $r $v $who $when) $fact ($s $r $v $who))))
+   (map-atom $facts $fact (let ($s $r $v $who $when $f) $fact ($s $r $v $who))))
 
 (= (live-tests)
    (progn
@@ -47,10 +47,20 @@
      ; One conjunction over two values finds the subject related to both.
      (test (let $facts (conjunction-facts ("tea" "coffee"))
              ((size-atom $facts)
-              (is-member ("omega-live-test" "likes" "tea" "" "") $facts)
-              (is-member ("omega-live-test" "likes" "coffee" "" "") $facts)))
+              (is-member ("omega-live-test" "likes" "tea" "" "" 1.0) $facts)
+              (is-member ("omega-live-test" "likes" "coffee" "" "" 1.0) $facts)))
            (2 True True))
      (test (conjunction-facts ("tea" "no-such-value")) ())
+     ; A denial replaces the stated value with the term believed false; the bare
+     ; Evaluation still answers a conjunction, and the denial takes it out.
+     (test (deny "I | likes | coffee") (DENIED "omega-live-test" "likes" "coffee"))
+     (test (let $facts (recall-facts-by-keys ("omega-live-test"))
+             ((size-atom $facts)
+              (is-member ("omega-live-test" "likes" "tea" 1.0) (map-atom $facts $f (let ($s $r $v $who $when $t) $f ($s $r $v $t))))
+              (is-member ("omega-live-test" "likes" "coffee" 0.0) (map-atom $facts $f (let ($s $r $v $who $when $t) $f ($s $r $v $t))))))
+           (2 True True))
+     (test (conjunction-facts ("tea" "coffee")) ())
+     (test (learn "I | likes | coffee") (LEARNED "omega-live-test" "likes" "coffee"))
      (test (let (UNLEARNED $s $r $values) (unlearn "I | likes")
              ($s $r (size-atom $values) (is-member "tea" $values) (is-member "coffee" $values)))
            ("omega-live-test" "likes" 2 True True))

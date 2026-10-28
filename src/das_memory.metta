@@ -110,6 +110,11 @@
 ; "human similar_to chimp" are both true), so a new value is added beside the
 ; old ones and nothing is forgotten without unlearn; recall lists the newest
 ; first. Each fact carries (Stated term "nick" "time") provenance.
+; A fact the user denies ("Team B is not playing the 2026 championship") is
+; the same term believed at (stv 0.0 0.9), so |~ and beliefs see a false
+; premise rather than a relation called not_playing, and recall reads it as
+; "team b is not playing 2026 championship". Stating the fact again with the
+; other truth replaces that one value and leaves the relation's other values.
 
 (= (current-message)
    (case (catch (get-state &prevmsg))
@@ -117,8 +122,9 @@
       ((Error $type) "")
       ($msg $msg))))
 
-; The truth given to a fact a user states.
+; The truth given to a fact a user states, and to one the user denies.
 (= (factTruth) (stv 1.0 0.9))
+(= (deniedTruth) (stv 0.0 0.9))
 
 ; Predicate is also a PeTTa builtin that builds Prolog terms, so the fact term
 ; is parsed from text and only ever bound by let or placed in add-atom,
@@ -131,6 +137,10 @@
 (= (relation-values $s $r)
    (collapse (match &das (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $tv) $found)))
 
+; The values of a relation with the strength each is believed at: (("tea" 1.0) ("coffee" 0.0)).
+(= (relation-truths $s $r)
+   (collapse (match &das (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) (stv $f $c)) ($found $f))))
+
 ; In DAS the Evaluation nested in a removed Belief stays as a link of its own
 ; and would be read back as a fact from another agent, so it is removed too;
 ; in a local space it is not a separate atom and the removal is a no-op.
@@ -141,25 +151,38 @@
                       (let ($who $when) $p (remove-atom &das (Stated $term $who $when))))
             (catch (remove-atom &das $term)))))
 
-(= (store-fact $s $r $v)
-   (let $old (relation-values $s $r)
-     (if (is-member $v $old)
+; A value already believed at the same strength is KNOWN; one believed at the
+; other strength is replaced, so "is not playing" after "is playing" leaves
+; one fact, the newer, and the relation's other values stay.
+(= (store-fact-as $s $r $v $tv $report)
+   (let* (((stv $strength $confidence) $tv)
+          ($truths (relation-truths $s $r)))
+     (if (is-member ($v $strength) $truths)
          (KNOWN $s $r $v)
-         (let* (($term (fact-term $s $r $v))
-                ($tv (factTruth))
+         (let* (($_ (if (is-member $v (relation-values $s $r)) (forget-value $s $r $v) ()))
+                ($term (fact-term $s $r $v))
                 ($who (sread (py-call (helper.speaker_literal (current-message)))))
                 ($when (get_time_as_string))
                 ($_ (add-atom &das (Belief $term $tv)))
                 ($_ (add-atom &das (Stated $term $who $when))))
-           (LEARNED $s $r $v)))))
+           ($report $s $r $v)))))
+
+(= (store-fact $s $r $v) (store-fact-as $s $r $v (factTruth) LEARNED))
 
 (= (learn $str)
    (case (sread (py-call (helper.parse_fact $str (current-message))))
      ((($s $r $v) (store-fact $s $r $v))
       ($_ (FACT_NOT_LEARNED "expected one short fact: subject | relation | value" $str)))))
 
+; A fact the user denies, stored as the term believed false.
+(= (deny $str)
+   (case (sread (py-call (helper.parse_fact $str (current-message))))
+     ((($s $r $v) (store-fact-as $s $r $v (deniedTruth) DENIED))
+      ($_ (FACT_NOT_LEARNED "expected one short fact: subject | relation | value" $str)))))
+
 (= (learn-all $reply)
-   (map-atom (sread (py-call (helper.extracted_facts $reply))) $fact (learn $fact)))
+   (union-atom (map-atom (sread (py-call (helper.extracted_facts $reply))) $fact (learn $fact))
+               (map-atom (sread (py-call (helper.extracted_denials $reply))) $fact (deny $fact))))
 
 (= (unlearn $str)
    (case (sread (py-call (helper.parse_fact_key $str (current-message))))
@@ -176,46 +199,82 @@
 ; so this bounds the delay per message.
 (= (maxFactConcepts) 3)
 
-; Facts about $key and facts whose value is $key, with their provenance, as
-; ("subject" relation "value" "who" "when"). Recall reads the Stated links:
-; every learned fact has one, and it answers "who told you that?" and "when?"
-; with no further query.
-; When no Stated link names the key, the bare Evaluation form is tried: that
-; is what other agents on the same router write, with no source, and also
-; where beliefs derived by |- or |~ end up. Other agents keep the spelling of
-; the user, so the key is tried as written in the message and in Title Case
-; besides lowercase. These are more queries, so they run only on a miss.
-; A three-place record (subject, value, value) is read as one value.
+; Facts about $key and facts whose value is $key, as
+; ("subject" "relation" "value" "who" "when" strength).
+; Learned facts are read with one conjunction of their Belief and Stated
+; links per side, so each comes with its truth (1.0 stated, 0.0 denied) and
+; its source, which answers "who told you that?" and "when?" with no further
+; query. The bare Evaluation form is read as well: that is what other agents
+; on the same router write, with no source and taken as true, and also where
+; beliefs derived by |- or |~ end up. Other agents keep the spelling of the
+; user, so the key is tried as written in the message and in Title Case
+; besides lowercase. A three-place record (subject, value, value) is read as
+; one value. Both forms run every time, because a name may have facts from
+; both sides ("team a" learned here and loaded by another agent); a learned
+; fact's own nested Evaluation also answers the bare query, and merge_facts
+; drops that copy in favour of the one with its source and truth.
 ; A user function inside a superpose list is collected as one list, so the
 ; match calls are written out.
 (= (stated-facts-about $key)
-   (collapse (superpose ((match &das (Stated (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) $who $when) ($key $r $v $who $when))
-                         (match &das (Stated (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) $who $when) ($s $r $key $who $when))
-                         (match &das (Stated (Evaluation (Predicate $r) (List (Concept $key) (Concept $v) (Concept $w))) $who $when)
-                                (let $joined (sread (py-call (helper.join_values $v $w))) ($key $r $joined $who $when)))))))
+   (collapse (superpose ((match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) (stv $f $c))
+                                        (Stated (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) $who $when))
+                                ($key $r $v $who $when $f))
+                         (match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) (stv $f $c))
+                                        (Stated (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) $who $when))
+                                ($s $r $key $who $when $f))))))
 
 ; superpose takes a bound list, not a call: the variants are bound first.
 (= (external-facts-about $key)
    (let $names (sread (py-call (helper.name_variants $key (current-message))))
      (let $name (superpose $names)
-       (superpose ((match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" ""))
-                   (match &das (Evaluation (Predicate $r) (List (Concept $s) (Concept $name))) ($s $r $name "" ""))
+       (superpose ((match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" "" 1.0))
+                   (match &das (Evaluation (Predicate $r) (List (Concept $s) (Concept $name))) ($s $r $name "" "" 1.0))
                    (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v) (Concept $w)))
-                          (let $joined (sread (py-call (helper.join_values $v $w))) ($name $r $joined "" ""))))))))
+                          (let $joined (sread (py-call (helper.join_values $v $w))) ($name $r $joined "" "" 1.0))))))))
 
 (= (facts-about $key)
    (let $stated (stated-facts-about $key)
-     (if (== $stated ())
-         (external-facts-about $key)
-         (superpose $stated))))
+     (let $external (collapse (external-facts-about $key))
+       (superpose (union-atom $stated $external)))))
+
+; The facts of one subject spelled as stored, both forms, as subject only:
+; three queries, where facts-about runs up to eleven for the name variants.
+(= (subject-facts $name)
+   (collapse (superpose ((match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) (stv $f $c))
+                                        (Stated (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) $who $when))
+                                ($name $r $v $who $when $f))
+                         (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" "" 1.0))
+                         (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v) (Concept $w)))
+                                (let $joined (sread (py-call (helper.join_values $v $w))) ($name $r $joined "" "" 1.0)))))))
+
+; A fact recalled from its value side names a subject the message did not:
+; "Team A founded_in Brasília" for the key "brasília". The question is usually
+; about that subject ("which team from Brasília has a blue logo"), so the rest
+; of its facts are read next, for up to maxFactConcepts such subjects, each as
+; stored and lowercase (another agent's "Team A", Omega's "team a"). Subjects
+; that were keys, or the sender, are already read in full.
+(= (expand-subjects $facts $keys $speaker)
+   (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts))))
+     (if (== $subjects ())
+         ()
+         (let $more (recall-failure
+                      (catch (unique-atom (collapse (let $subject (superpose $subjects)
+                                                      (let $found (subject-facts $subject) (superpose $found)))))))
+           (progn (log INFO "das-memory" (DAS_EXPANDED $subjects FOUND: (size-atom $more)))
+                  $more)))))
 
 ; Arguments are evaluated before a call, so the nondeterministic query must be
 ; collapsed inside the function that logs a failure, not passed to one.
-(= (recall-failure $rc)
+(= (query-failure $rc)
    (case $rc
      (((Error $type $ctx) (progn (log WARNING "das-memory" (FACTS_NOT_RECALLED $type)) ()))
       ((Error $type) (progn (log WARNING "das-memory" (FACTS_NOT_RECALLED $type)) ()))
-      ($facts $facts))))
+      ($answers $answers))))
+
+; Recalled fact tuples, with the sourceless copy of a learned fact dropped.
+(= (recall-failure $rc)
+   (let $facts (query-failure $rc)
+     (if (== $facts ()) () (sread (py-call (helper.merge_facts (repr $facts)))))))
 
 (= (recall-facts-by-keys $keys)
    (recall-failure (catch (unique-atom (collapse (let $key (superpose $keys) (facts-about $key)))))))
@@ -223,7 +282,9 @@
 ; The sender is looked up as a subject only; the other names from both sides.
 (= (recall-facts-for $speaker $keys)
    (recall-failure
-     (catch (unique-atom (collapse (superpose ((match &das (Stated (Evaluation (Predicate $r) (List (Concept $speaker) (Concept $v))) $who $when) ($speaker $r $v $who $when))
+     (catch (unique-atom (collapse (superpose ((match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $speaker) (Concept $v))) (stv $f $c))
+                                                              (Stated (Evaluation (Predicate $r) (List (Concept $speaker) (Concept $v))) $who $when))
+                                                      ($speaker $r $v $who $when $f))
                                                (let $key (superpose $keys) (facts-about $key)))))))))
 
 ; A question about something that must meet several conditions at once, such
@@ -236,7 +297,9 @@
 ; but the client returns nothing, so a third value is paired with the first
 ; and conjunction_facts keeps the subjects seen with every value.
 ; The queries are built as text and read with sread, so the shared $s binds
-; across the clauses of each pattern.
+; across the clauses of each pattern. The bare Evaluation of a denied fact
+; also answers, so the beliefs of each matched subject are read and a fact
+; believed false does not count as meeting its condition.
 (= (conjunction-facts $values)
    (if (== $values ())
        ()
@@ -244,9 +307,21 @@
          (let $found (recall-failure
                        (catch (unique-atom (collapse (let ($pattern $template) (superpose $queries)
                                                        (let $facts (match &das $pattern $template) (superpose $facts)))))))
-           (let $kept (sread (py-call (helper.conjunction_facts (repr $found) (repr $values) (current-message))))
-             (progn (log INFO "das-memory" (DAS_CONJUNCTION $values FOUND: $kept))
-                    $kept))))))
+           (let $true (without-denied $found)
+             (let $kept (sread (py-call (helper.conjunction_facts (repr $true) (repr $values) (current-message))))
+               (progn (log INFO "das-memory" (DAS_CONJUNCTION $values FOUND: $kept))
+                      $kept)))))))
+
+(= (subject-beliefs $subjects)
+   (collapse (let $subject (superpose $subjects)
+               (match &das (Belief (Evaluation (Predicate $r) (List (Concept $subject) (Concept $v))) (stv $f $c)) ($subject $r $v $f)))))
+
+(= (without-denied $facts)
+   (if (== $facts ())
+       ()
+       (let $subjects (sread (py-call (helper.fact_subjects (repr $facts))))
+         (let $beliefs (query-failure (catch (subject-beliefs $subjects)))
+           (sread (py-call (helper.drop_denied (repr $facts) (repr $beliefs))))))))
 
 ; Recall from the words of the message alone, used when no extraction reply is available.
 (= (recall-facts $msg)

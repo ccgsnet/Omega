@@ -52,8 +52,12 @@ memoryExportEnabled: false
 dasRouter: ""
 # Extract facts and lookup names from each user message with a separate model call
 autoLearnFacts: True
-# Output cap passed to the provider for that extraction call; reasoning models spend most of it thinking
+# Output cap passed to the provider for that extraction call; reasoning models spend most of it thinking.
+# When the model runs out, the call is retried once with twice the cap.
 factExtractionTokens: 4000
+# Reasoning-effort hint for that extraction call; empty means the agent's reasoningMode.
+# Ollama's OpenAI endpoint accepts none/low/medium/high (`none` disables thinking: fast but sloppier).
+#factExtractionReasoning: low
 
 # Policy
 

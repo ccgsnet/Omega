@@ -20,7 +20,7 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | `LLM` | `gpt-5.4` | Model identifier passed to the provider. |
 | `provider` | `Anthropic` | LLM provider — `Anthropic`, `OpenAI`, `ASICloud`, or `ASIOne`. |
 | `maxOutputToken` | 6000 | Output cap passed to the provider. |
-| `reasoningMode` | `medium` | Reasoning-effort hint passed to the provider. |
+| `reasoningMode` | `medium` | Reasoning-effort hint passed to the provider (`reasoning_effort` on OpenAI-compatible endpoints). |
 | `wakeupInterval` | 600 (seconds) | How long idle before the next scheduled wake-up. |
 
 ## Memory (`src/memory.metta`, `initMemory`)
@@ -41,8 +41,9 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | Key | Default | Description |
 |---|---|---|
 | `dasRouter` | empty | `host:port` of the DAS Command Router that backs the `&das` space holding facts and beliefs, for example `host.docker.internal:40009`. `scripts/omega start --das <host:port>` sets it. Empty keeps `&das` an in-process space that does not persist across restarts. Read before the loop starts, so it must come from the command line, `OMEGA_dasRouter` or the config file. |
-| `autoLearnFacts` | `True` | Make one extra model call per user message to extract the facts it states (`FACT subject \| relation \| value`) and the names it asks about (`LOOKUP name`). |
-| `factExtractionTokens` | 4000 | Output cap passed to the provider for that extraction call. Reasoning models spend most of it thinking; at 1000 `ornith-1.5:9b` ran out before answering. |
+| `autoLearnFacts` | `True` | Make one extra model call per user message to extract the facts it states (`FACT subject \| relation \| value`), the facts it denies (`NOT subject \| relation \| value`), the names it asks about (`LOOKUP name`) and the conditions it joins (`ALL`/`ANY value \| value`). |
+| `factExtractionTokens` | 4000 | Output cap passed to the provider for that extraction call. Reasoning models spend most of it thinking; at 1000 `ornith-1.5:9b` ran out before answering. When the model runs out, the call is retried once with twice the cap; if that fails too the message is logged as `FACTS_NOT_EXTRACTED` and nothing is learned. |
+| `factExtractionReasoning` | `reasoningMode` | Reasoning-effort hint for the extraction call only. The OpenAI-compatible provider sends it as `reasoning_effort`; Ollama accepts `none`, `low`, `medium`, `high` (`none` disables thinking, which is fast but sloppier). Providers that reject the parameter are detected once and the hint is dropped for the rest of the run. |
 
 ## Channels (`src/channels.metta`, `initChannels`)
 

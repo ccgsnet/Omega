@@ -9,6 +9,7 @@
 (= (spamShield) (empty)) ; TODO: this parameter is considered deprecated
 (= (autoLearnFacts) (empty))
 (= (factExtractionTokens) (empty))
+(= (factExtractionReasoning) (empty))
 
 (= (initLoop)
    (progn (configure maxNewInputLoops 50) ;20
@@ -21,6 +22,7 @@
           (configure wakeupInterval 600) ;600=10 minutes
           (configure autoLearnFacts True)
           (configure factExtractionTokens 4000)
+          (configure factExtractionReasoning (reasoningMode))
           (configure memoryDirectory
                (joinPath ((py-call (helper.projectRootDirectory)) memory)))
           (change-state! &prevmsg "")
@@ -29,6 +31,7 @@
           (change-state! &replyTurns 0)
           (change-state! &pendingResults "")
           (change-state! &knownFacts "none")
+          (change-state! &lastFactKeys ())
           ))
 
 ; Turns a user message stays unanswered-visible while the agent gathers
@@ -39,13 +42,27 @@
 ; separate model call before the agent sees the message, so storing and recall
 ; do not depend on the agent choosing a skill. Messages that can state or ask
 ; nothing, such as auth, skill calls and short acknowledgements, skip the call.
+; A reasoning model may spend the whole output budget thinking and answer
+; nothing; the provider then returns its token-limit message, and the call is
+; made once more with twice the budget before the message is given up as
+; FACTS_NOT_EXTRACTED. The effort is factExtractionReasoning, by default the
+; agent's reasoningMode.
+(= (extraction-call $msg $tokens)
+   (case (catch (llmProviderChat (py-call (helper.fact_extraction_prompt $msg)) $tokens (factExtractionReasoning)))
+     (((Error $type $ctx) (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED $type)) "NONE"))
+      ((Error $type) (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED $type)) "NONE"))
+      ($reply $reply))))
+
 (= (extract-from-message $msg)
    (if (and (autoLearnFacts) (py-call (helper.needs_fact_extraction $msg)))
-       (case (catch (llmProviderChat (py-call (helper.fact_extraction_prompt $msg))
-                                     (factExtractionTokens) (reasoningMode)))
-         (((Error $type $ctx) (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED $type)) "NONE"))
-          ((Error $type) (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED $type)) "NONE"))
-          ($reply $reply)))
+       (let $reply (extraction-call $msg (factExtractionTokens))
+         (if (py-call (helper.is_token_limit_reply $reply))
+             (let $retry (extraction-call $msg (* 2 (factExtractionTokens)))
+               (if (py-call (helper.is_token_limit_reply $retry))
+                   (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED "reasoning used the whole token budget twice" (* 2 (factExtractionTokens))))
+                          "NONE")
+                   $retry))
+             $reply))
        "NONE"))
 
 (= (learn-from-reply $reply)
@@ -55,26 +72,40 @@
                      (log INFO "das-memory" (FACTS_EXTRACTED: $reply LEARNED: $learned))
                      $learned)))))
 
-; The names queried in DAS for a message besides the sender: the LOOKUP names,
-; the subjects of the nearest indexed facts, and capitalised message words only
-; when the extraction named nothing.
+; The names queried in DAS for a message besides the sender: the LOOKUP names
+; and the subjects of FACT/NOT lines (a statement often has no LOOKUP), a
+; spelling of those names from the FACT index (brasília for brasilia), and
+; capitalised message words only when the extraction named nothing. A follow-up
+; that names nothing keeps the previous keys, so "Try again" does not inherit
+; the last learned fact about someone else.
 (= (recall-keys $msg $reply)
    (sread (py-call (helper.recall_keys $msg
                                        (py-call (helper.extracted_lookups $reply $msg (maxFactConcepts)))
                                        (indexed-fact-keys $msg (maxFactConcepts))
-                                       (maxFactConcepts)))))
+                                       (maxFactConcepts)
+                                       (repr (get-state &lastFactKeys))))))
 
 ; Facts are recalled by name, and a question that joins conditions with and
 ; also runs one DAS conjunction over its values (ALL in the extraction reply);
 ; a question joining them with or looks up each value (ANY), which is the
-; union of their facts.
+; union of their facts. An ALL value that names the attribute ("logo") instead
+; of the stored value ("blue") is rewritten from the message before the query.
+; The ALL values are looked up as names as well, so a conjunction that still
+; misses finds the facts of each value; and the subjects those facts name,
+; which the message did not, are read in full (expand-subjects).
 (= (remember-message $msg)
    (let* (($reply (extract-from-message $msg))
           ($_ (learn-from-reply $reply))
           ($speaker (sread (py-call (helper.speaker_literal $msg))))
-          ($facts (recall-facts-for $speaker (recall-keys $msg $reply)))
-          ($joint (conjunction-facts (sread (py-call (helper.extracted_conjunction $reply $msg))))))
-     (change-state! &knownFacts (describe-facts (unique-atom (union-atom $facts $joint)) $msg))))
+          ($keys (recall-keys $msg $reply))
+          ($_ (progn (change-state! &lastFactKeys $keys)
+                     (log INFO "das-memory" (DAS_RECALL_KEYS $keys))))
+          ($facts (recall-facts-for $speaker $keys))
+          ($joint (conjunction-facts (sread (py-call (helper.extracted_conjunction $reply $msg)))))
+          ($found (unique-atom (union-atom $facts $joint)))
+          ($more (expand-subjects $found $keys $speaker))
+          ($known (sread (py-call (helper.merge_facts (repr (union-atom $found $more)))))))
+     (change-state! &knownFacts (describe-facts $known $msg))))
 
 ; Small models often send idle chatter such as "No new user input." despite the
 ; prompt, so a send is only run while a user message is waiting for a reply.
