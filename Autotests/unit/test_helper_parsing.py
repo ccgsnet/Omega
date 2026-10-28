@@ -177,6 +177,15 @@ def test_fact_text_keeps_non_ascii_letters_unescaped(helper):
     assert helper.fact_query_keys("ana: Onde fica Brasília?", 3) == '("ana" "onde" "brasília" "fica")'
 
 
+def test_parse_fact_peels_attribute_off_a_compound_subject(helper):
+    # The 9B model wrote FACT team b jersey | color | red, which DAS stored
+    # under Concept "team b jersey" and a "team b" lookup then missed.
+    assert helper.parse_fact("team b jersey | color | red", "") == '("team b" "jersey" "red")'
+    assert helper.parse_fact("team b flag | color | red", "") == '("team b" "flag" "red")'
+    assert helper.parse_fact("team b logo | color | red", "") == '("team b" "logo" "red")'
+    assert helper.parse_fact("team a | jersey | blue", "") == '("team a" "jersey" "blue")'
+
+
 def test_parse_fact_rejects_sentences_and_long_fields(helper):
     assert helper.parse_fact("The capital of Brazil has more than one million people actual", "") == "()"
     assert helper.parse_fact("I city big city population threshold is 500k people", "") == "()"
@@ -563,6 +572,17 @@ def test_unknown_skill_only_matches_prose(helper):
 def test_unknown_skill_only_keeps_a_real_send(helper):
     parsed = helper.balance_parentheses("send Paris is the capital")
     assert helper.unknown_skill_only(parsed) is False
+
+
+def test_balance_recovers_send_glued_with_underscore(helper):
+    parsed = helper.balance_parentheses(
+        "send_What I know about Team A:\n\n- Color: blue\n- Revenue: 210 000 000"
+    )
+    assert parsed == (
+        '((send "What I know about Team A:\\n\\n- Color: blue\\n- Revenue: 210 000 000"))'
+    )
+    assert helper.unknown_skill_only(parsed) is False
+    assert helper.answered_user(parsed) is True
 
 
 # --- normalize_string -----------------------------------------------------

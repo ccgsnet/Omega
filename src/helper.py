@@ -321,6 +321,15 @@ def _fact_fields(text, count, message):
         return None
     if len(subject) == 1 and subject[0] in FACT_SELF_WORDS:
         subject = [message_speaker(message) or "user"]
+    # "team b jersey | color | red" is about team b; the garment belongs in the
+    # relation, which is how "team a | jersey | blue" is stored and recalled.
+    if len(subject) > 1 and subject[-1] in FACT_ATTRIBUTES:
+        attr = subject[-1]
+        subject = subject[:-1]
+        if count >= 2:
+            rel = fields[1]
+            if not rel or rel[0] in FACT_ATTRIBUTES | {"has", "have", "is", "are"}:
+                fields[1] = [attr]
     relations = [_relation_words(words) for words in fields[1:2]]
     return [" ".join(subject)] + ["_".join(words) for words in relations] + [" ".join(words) for words in fields[2:]]
 
@@ -458,6 +467,7 @@ FACT_EXTRACTION_PROMPT = (
     "Which city is on the coast and hosted the 1992 games? -> ALL coast | 1992\n"
     "Which player has green eyes and is from Oslo? -> ALL green | Oslo\n"
     "Which team has its logo blue and is from Oslo? -> ALL blue | Oslo\n"
+    "The jersey, flag, and logo of Porto are blue. -> FACT Porto | jersey | blue\nFACT Porto | flag | blue\nFACT Porto | logo | blue\n"
     "Which servers run Ubuntu or Debian? -> ANY Ubuntu | Debian\n"
     "Does Ana work at Acme and live in Lisbon? -> LOOKUP Ana\nALL Acme | Lisbon\n"
     "Servers with more than 64 GB are large. -> NONE (a rule with a condition, not a fact about one subject)\n"
@@ -983,6 +993,18 @@ def fact_query_keys(message, limit=3, names_only=False):
             candidates.append(key)
     return _strings(*([speaker] if speaker else []), *candidates[:int(limit)])
 
+def _glued_send_arg(token):
+    """The rest of a send glued onto the skill name, such as send_What or send-What.
+
+    Small models write send_The answer is... instead of send The answer is...
+    """
+    for sep in ("_", "-", ":"):
+        prefix = "send" + sep
+        if token.startswith(prefix) and len(token) > len(prefix):
+            return token[len(prefix):]
+    return None
+
+
 def starts_command_line(line):
     s = line.lstrip()
     if not s:
@@ -993,7 +1015,7 @@ def starts_command_line(line):
     if not s:
         return False
     first = s.split(maxsplit=1)[0].rstrip(")")
-    return first in LLM_COMMANDS
+    return first in LLM_COMMANDS or _glued_send_arg(first) is not None
 
 def split_command_blocks(s):
     blocks = []
@@ -1033,6 +1055,10 @@ def balance_parentheses(s):
             continue
         cmd = parts[0]
         rest = parts[1].strip() if len(parts) > 1 else ""
+        glued = _glued_send_arg(cmd)
+        if glued is not None:
+            cmd = "send"
+            rest = f"{glued} {rest}".strip() if rest else glued
         if cmd not in LLM_COMMANDS:
             # Do not let model commentary become a MeTTa expression.  The
             # loop turns this into ALERT_FAILED feedback for the next turn.
