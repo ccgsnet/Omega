@@ -243,6 +243,18 @@ def test_clean_reply_removes_format_noise_seen_in_chat(helper):
     assert helper.clean_reply("Divinópolis_apostrophe_ people are poor_newline_Said by you.") == (
         "Divinópolis' people are poor\nSaid by you."
     )
+    assert helper.clean_reply("_quote__apostrophe_Noted: Team B is not playing the 2026 championship._apostrophe__quote_") == (
+        "Noted: Team B is not playing the 2026 championship."
+    )
+    assert helper.clean_reply("'_Noted. Here's what I know about Team A:_") == (
+        "Noted. Here's what I know about Team A:"
+    )
+    assert helper.clean_reply(
+        "`'_Team B has a red logo and is from Divinópolis.'` Team B has a red logo and is from Divinópolis."
+    ) == "Team B has a red logo and is from Divinópolis."
+    assert helper.clean_reply("'_Noted: Team B. Team B is not in the 2026 championship.") == (
+        "Noted: Team B. Team B is not in the 2026 championship."
+    )
 
 
 def test_clean_reply_keeps_ordinary_replies(helper):

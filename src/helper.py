@@ -167,7 +167,8 @@ def is_send_call(command):
 
 
 REPLY_MARKERS = (("_quote_", '"'), ("_newline_", "\n"), ("_apostrophe_", "'"))
-REPLY_QUOTES = (('"', '"'), ("\u201c", "\u201d"), ("\u00ab", "\u00bb"))
+REPLY_QUOTES = (('"', '"'), ("'", "'"), ("`", "`"), ("_", "_"), ("*", "*"),
+                ("\u201c", "\u201d"), ("\u00ab", "\u00bb"))
 ECHO_MIN_OVERLAP = 0.5
 
 
@@ -180,27 +181,59 @@ def _echoes(line, text):
     return bool(words) and len(words & said) / len(words) >= ECHO_MIN_OVERLAP
 
 
+def _unwrap_reply(text):
+    """Peel quotes, backticks and emphasis the model wrapped around the whole answer.
+
+    Nested wrappers and a leftover opening mark (`'_Noted...`) are removed;
+    quotes that belong to the sentence (`He said "hi"`) are kept.
+    """
+    changed = True
+    while text and changed:
+        changed = False
+        text = text.strip()
+        for opening, closing in REPLY_QUOTES:
+            n = len(opening)
+            if len(text) > n and text.startswith(opening) and text.endswith(closing):
+                text = text[n:-len(closing)].strip()
+                changed = True
+                break
+        else:
+            if text[0] in "'\"`_":
+                text = text[1:]
+                changed = True
+    return text.strip()
+
+
+def _drop_duplicated_wrap(text):
+    """A quoted copy of the answer sitting in front of the same answer."""
+    match = re.match(r"^[`\"'_]+(.+?)[`\"'_]+\s+(.*)$", text, re.DOTALL)
+    if match and match.group(1).strip() == match.group(2).strip():
+        return match.group(1).strip()
+    return text
+
+
 def clean_reply(reply, message=""):
     """The text of a send as the user should read it.
 
     Small models leak their format into replies: the escape markers of the
-    prompt, quotes around the whole answer, a skill call appended to the
-    text, and the user's question repeated before the answer. Each is
-    removed; an empty result means there is nothing to send.
+    prompt, quotes/backticks/underscores around the whole answer, a skill
+    call appended to the text, and the user's question repeated before the
+    answer. Each is removed; an empty result means there is nothing to send.
     """
     text = str(reply or "")
+    text = re.sub(r"</?think>", "", text)
     for marker, char in REPLY_MARKERS:
         text = text.replace(marker, char)
     # A marker copied without its underscore at either end of the text.
-    text = re.sub(r"^\s*quote_|quote_\s*$", '"', text)
+    text = re.sub(r"^\s*(?:quote_|apostrophe_|newline_)+", "", text)
+    text = re.sub(r"(?:quote_|apostrophe_|newline_)+\s*$", "", text)
     # One or more skill calls written after the answer, such as (learn a | b | c);
     # learn is no longer a skill but models still write it.
     commands = "|".join(re.escape(cmd) for cmd in sorted(LLM_COMMANDS | {"learn"}))
     text = re.sub(rf"(?:\s*\((?:{commands})\b[^()]*\))+\s*$", "", text)
-    text = text.strip()
-    for opening, closing in REPLY_QUOTES:
-        if len(text) > 1 and text.startswith(opening) and text.endswith(closing) and text.count(opening) == 1 + (opening == closing):
-            text = text[1:-1].strip()
+    text = _drop_duplicated_wrap(text.strip())
+    text = _unwrap_reply(text)
+    text = re.sub(r"[`\"'_]+$", "", text).strip()
     lines = text.split("\n")
     if len(lines) > 1 and _echoes(lines[0], _latest_text(message)):
         lines = lines[1:]
