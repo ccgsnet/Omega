@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.request
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +24,6 @@ STATIC_LLM_COMMANDS = {
     "das-recall",
     "das-store",
     "episodes",
-    "learn",
     "metta",
     "pin",
     "query",
@@ -151,7 +151,7 @@ def skill_names(response):
     return names
 
 
-REPLY_SAFE_SKILLS = ("send", "pin", "learn", "unlearn", "remember")
+REPLY_SAFE_SKILLS = ("send", "pin", "unlearn", "remember")
 
 
 def answered_user(response):
@@ -163,6 +163,48 @@ def answered_user(response):
 def is_send_call(command):
     """True when one skill call, as printed by repr, is a send."""
     return skill_names(f"({command})") == ["send"]
+
+
+REPLY_MARKERS = (("_quote_", '"'), ("_newline_", "\n"), ("_apostrophe_", "'"))
+REPLY_QUOTES = (('"', '"'), ("\u201c", "\u201d"), ("\u00ab", "\u00bb"))
+ECHO_MIN_OVERLAP = 0.5
+
+
+def _echoes(line, text):
+    """True when the question in line mostly repeats the words of text."""
+    if not line.rstrip().endswith("?"):
+        return False
+    words = set(re.findall(r"\w+", line.lower()))
+    said = set(re.findall(r"\w+", text.lower()))
+    return bool(words) and len(words & said) / len(words) >= ECHO_MIN_OVERLAP
+
+
+def clean_reply(reply, message=""):
+    """The text of a send as the user should read it.
+
+    Small models leak their format into replies: the escape markers of the
+    prompt, quotes around the whole answer, a skill call appended to the
+    text, and the user's question repeated before the answer. Each is
+    removed; an empty result means there is nothing to send.
+    """
+    text = str(reply or "")
+    for marker, char in REPLY_MARKERS:
+        text = text.replace(marker, char)
+    # A marker copied without its underscore at either end of the text.
+    text = re.sub(r"^\s*quote_|quote_\s*$", '"', text)
+    # One or more skill calls written after the answer, such as (learn a | b | c);
+    # learn is no longer a skill but models still write it.
+    commands = "|".join(re.escape(cmd) for cmd in sorted(LLM_COMMANDS | {"learn"}))
+    text = re.sub(rf"(?:\s*\((?:{commands})\b[^()]*\))+\s*$", "", text)
+    text = text.strip()
+    for opening, closing in REPLY_QUOTES:
+        if len(text) > 1 and text.startswith(opening) and text.endswith(closing) and text.count(opening) == 1 + (opening == closing):
+            text = text[1:-1].strip()
+    lines = text.split("\n")
+    if len(lines) > 1 and _echoes(lines[0], _latest_text(message)):
+        lines = lines[1:]
+    text = re.sub(r"\n\s*\n+", "\n\n", "\n".join(lines)).strip()
+    return text
 
 
 FACT_SELF_WORDS = {"i", "me", "my", "mine", "myself", "user"}
@@ -202,6 +244,10 @@ def message_speaker(message):
 
 
 FACT_ARTICLES = {"a", "an", "the"}
+# A field that is only a placeholder means the model had no subject or value.
+FACT_PLACEHOLDERS = {"none", "unknown", "null", "n/a", "nobody", "nothing"}
+# A relation that only says "this is a note" carries a sentence, not a fact.
+RELATION_PLACEHOLDERS = {"note", "notes", "noted", "fact", "facts", "info", "information", "memo", "remember", "said", "says"}
 # Longest subject, relation and value accepted, in words. A longer field means
 # a sentence was passed instead of one fact about one named thing.
 FACT_MAX_WORDS = (4, 3, 6)
@@ -218,6 +264,8 @@ def _fact_fields(text, count, message):
         return None
     if any(len(words) > limit for words, limit in zip(fields, FACT_MAX_WORDS)):
         return None
+    if any(len(words) == 1 and words[0] in FACT_PLACEHOLDERS for words in fields):
+        return None
     subject = fields[0]
     while len(subject) > 1 and subject[0] in FACT_ARTICLES:
         subject = subject[1:]
@@ -225,7 +273,15 @@ def _fact_fields(text, count, message):
         return None
     if len(subject) == 1 and subject[0] in FACT_SELF_WORDS:
         subject = [message_speaker(message) or "user"]
-    return [" ".join(subject), "_".join(fields[1])] + [" ".join(words) for words in fields[2:]]
+    relations = [_relation_words(words) for words in fields[1:2]]
+    return [" ".join(subject)] + ["_".join(words) for words in relations] + [" ".join(words) for words in fields[2:]]
+
+
+def _relation_words(words):
+    """'is similar to' and 'similar to' name the same relation; 'is a' keeps its verb."""
+    if len(words) > 2 and words[0] in ("is", "are"):
+        return words[1:]
+    return words
 
 
 def _strings(*tokens):
@@ -233,39 +289,114 @@ def _strings(*tokens):
 
 
 def parse_fact(text, message=""):
-    """'subject | relation | value' as '("subject" relation "value")', or '()' when it is not one short fact.
+    """'subject | relation | value' as '("subject" "relation" "value")', or '()' when it is not one short fact.
 
-    The relation is a symbol and the value a string, as a column name and its
-    literal value are in DAS Sql2AtomsMapper predicates.
+    All three are strings: the relation is a snake_case name such as "similar_to".
     """
     fields = _fact_fields(text, 3, message)
-    if fields is None:
+    if fields is None or fields[1] in RELATION_PLACEHOLDERS:
         return "()"
-    subject, relation, value = fields
-    return f"({metta_string(subject)} {relation} {metta_string(value)})"
+    return _strings(*fields)
+
+
+def fact_term(subject, relation, value):
+    """The PLN atom for a fact, as text for sread.
+
+    (Evaluation (Predicate "relation") (List (Concept "subject") (Concept "value"))) is the
+    binary form the lib_pln rules match, so a stored fact is a premise for |~. The
+    predicate name is a string: DAS tells (Predicate similar_to) from
+    (Predicate "similar_to"), and other agents writing to the same DAS use the
+    string form, so a grounded query from either side finds the other's facts.
+    """
+    return (f"(Evaluation (Predicate {metta_string(fact_token(relation))}) "
+            f"(List (Concept {metta_string(str(subject))}) (Concept {metta_string(str(value))})))")
+
+
+def name_variants(key, message=""):
+    """Spellings of a recall key to try against facts written by other agents.
+
+    Omega lowercases concept names; other writers keep the user's spelling. The
+    key as written in the message and in Title Case cover the common cases.
+    """
+    key = normalize_string(key).strip()
+    variants = [key]
+    for spelling in (next((m.group(0) for m in [re.search(re.escape(key), _latest_text(message), re.IGNORECASE)] if m), ""),
+                     key.title()):
+        if spelling and spelling not in variants:
+            variants.append(spelling)
+    return _strings(*variants)
+
+
+def join_values(*values):
+    """A three-place record's values as one MeTTa string: (List subject "1986" "26") reads as "1986 26"."""
+    return metta_string(" ".join(normalize_string(v) for v in values))
+
+
+def das_ping(endpoint, timeout=3):
+    """True when the DAS Command Router at host:port answers GET /ping, or when no router is configured.
+
+    Anything that is not host:port counts as no router: &das is then an in-process space.
+    """
+    endpoint = normalize_string(endpoint).strip()
+    if not re.fullmatch(r"[\w.\-]+:\d+", endpoint):
+        return True
+    try:
+        with urllib.request.urlopen(f"http://{endpoint}/ping", timeout=timeout) as resp:
+            return "PONG" in resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        logger.warning(f"DAS router {endpoint} does not answer /ping: {e}")
+        return False
+
+
+def speaker_literal(message):
+    """The sender's nick as a MeTTa string, "user" when the message names no sender."""
+    return metta_string(message_speaker(message) or "user")
 
 
 def parse_fact_key(text, message=""):
-    """'subject | relation' as '("subject" relation)', or '()' when malformed."""
+    """'subject | relation' as '("subject" "relation")', or '()' when malformed."""
     fields = _fact_fields(text, 2, message)
     if fields is None:
         return "()"
-    subject, relation = fields
-    return f"({metta_string(subject)} {relation})"
+    return _strings(*fields)
 
 
 FACT_EXTRACTION_PROMPT = (
-    "Extract the lasting facts the speaker states as true about one named person or thing in the message below.\n"
-    "Write one line per fact: FACT subject | relation | value\n"
-    "subject: the person or thing, at most 4 words, I for the speaker. "
+    "Read the message below.\n"
+    "For each lasting fact the speaker states as true about one subject, write one line: "
+    "FACT subject | relation | value\n"
+    "subject: a named person or thing, or a kind of thing such as banana or human; at most 4 words, I for the speaker. "
     "relation: at most 3 words. value: at most 6 words.\n"
+    "For each named person or thing the speaker asks about, write one line: LOOKUP name\n"
+    "name: the person or thing, at most 4 words, I for the speaker.\n"
+    "For a question about something that must meet several conditions at once, write one line: "
+    "ALL value | value\n"
+    "For a question about something that meets any one of several conditions, write one line: "
+    "ANY value | value\n"
+    "value: one word or number from the message that the thing must be related to, such as a color, "
+    "a place, a year or a name; never the kind of thing asked for (team, city, person); at most 3 values.\n"
     "Examples:\n"
     "My favorite color is blue. -> FACT I | favorite color | blue\n"
-    "Brasilia is the capital of Brazil. -> FACT Brazil | capital | Brasilia\n"
-    "I live in Belo Horizonte and my dog is Rex. -> FACT I | lives in | Belo Horizonte\nFACT I | dog | Rex\n"
-    "Cities with more than 500k people are big cities. -> NONE (a general rule, not about one thing)\n"
-    "What is my favorite color? -> NONE (a question)\n"
-    "Questions, requests, commands and general rules are not facts. If there is no fact, write NONE.\n"
+    "My sister Ana works at Acme as a designer. -> FACT Ana | works at | Acme\nFACT Ana | job | designer\n"
+    "The staging server runs Ubuntu 22.04 and our standup is at 9:30. -> FACT staging server | runs | Ubuntu 22.04\nFACT standup | time | 9:30\n"
+    "I moved to Lisbon last year. -> FACT I | lives in | Lisbon\n"
+    "People from Oslo are tall and the Acme team is remote. -> FACT Oslo | people | tall\nFACT Acme team | work mode | remote\n"
+    "Bananas are a fruit and dolphins are mammals. -> FACT banana | is a | fruit\nFACT dolphin | is a | mammal\n"
+    "What is my favorite color? -> LOOKUP I\n"
+    "When is the standup and who runs it? -> LOOKUP standup\n"
+    "Tell me about Ana's job. -> LOOKUP Ana\n"
+    "Who uses Ubuntu? -> LOOKUP Ubuntu\n"
+    "Who said people from Oslo are tall? -> LOOKUP Oslo\n"
+    "Who lives in Lisbon and works at Acme? -> ALL Lisbon | Acme\n"
+    "Which city is on the coast and hosted the 1992 games? -> ALL coast | 1992\n"
+    "Which servers run Ubuntu or Debian? -> ANY Ubuntu | Debian\n"
+    "Does Ana work at Acme and live in Lisbon? -> LOOKUP Ana\nALL Acme | Lisbon\n"
+    "Servers with more than 64 GB are large. -> NONE (a rule with a condition, not a fact about one subject)\n"
+    "Please list the files. -> NONE (a request)\n"
+    "A statement about the people, members or parts of a named thing is a fact about that thing. "
+    "Every question that names a person or thing gets a LOOKUP line, whatever the topic. "
+    "A question that joins conditions with and gets an ALL line, with or an ANY line, besides any LOOKUP. "
+    "Requests, commands and rules with a condition give nothing. If there is no FACT, LOOKUP, ALL or ANY, write NONE.\n"
     "MESSAGE: "
 )
 
@@ -279,16 +410,203 @@ def fact_extraction_prompt(message):
     return FACT_EXTRACTION_PROMPT + _latest_text(message)
 
 
+# Messages that cannot state or ask about a fact skip the extraction model call:
+# the authentication command, direct skill calls, and short acknowledgements.
+FACT_SKIP_MIN_WORDS = 3
+
+
+def needs_fact_extraction(message):
+    """True when the latest message may state or ask about a fact."""
+    text = _latest_text(message)
+    words = text.split()
+    if not words:
+        return False
+    first = words[0].lower()
+    if first == "auth" or first in LLM_COMMANDS:
+        return False
+    return len(words) >= FACT_SKIP_MIN_WORDS or text.endswith("?")
+
+
+def _extraction_entries(reply, tag):
+    """The text after each 'TAG ' in an extraction reply, without quotes, comments and arrows."""
+    text = re.sub(r"[\"\\`*]", "", str(reply or ""))
+    entries = []
+    for line in text.splitlines():
+        for part in re.split(rf"\b{tag}\s+", line)[1:]:
+            entry = re.sub(r"\(.*?\)", "", part.split("->")[0]).strip(" ,;.")
+            if entry:
+                entries.append(entry)
+    return entries
+
+
 def extracted_facts(reply):
     """'subject | relation | value' strings from FACT entries of an extraction reply."""
-    text = re.sub(r"[\"\\`*]", "", str(reply or ""))
-    facts = []
-    for line in text.splitlines():
-        for part in re.split(r"\bFACT\s+", line)[1:]:
-            fact = re.sub(r"\(.*?\)", "", part.split("->")[0]).strip(" ,;.")
-            if fact:
-                facts.append(fact)
-    return _strings(*facts)
+    return _strings(*_extraction_entries(reply, "FACT"))
+
+
+def extracted_lookups(reply, message="", limit=3):
+    """Concept names from LOOKUP entries of an extraction reply, the speaker for I/me/my.
+
+    A name of several words such as "Oslo people" also gives each capitalised word
+    on its own, as the fact is most likely stored under "oslo". The values of an
+    ANY entry (a question joining conditions with or) are looked up the same way:
+    recall reads a name on both sides of a fact, so the union of their facts is
+    the OR of the conditions.
+    """
+    speaker = message_speaker(message)
+    names = []
+
+    def add(name):
+        if name and name != speaker and name not in names:
+            names.append(name)
+
+    for entry in _extraction_entries(reply, "LOOKUP"):
+        fields = _fact_fields(entry, 1, message)
+        if not fields:
+            continue
+        add(fields[0])
+        words = entry.split()
+        if len(words) > 1:
+            for word in words:
+                token = fact_token(word)
+                if word[0].isupper() and len(token) >= 3 and token not in FACT_STOPWORDS:
+                    add(token)
+    for value in _entry_values(reply, "ANY", message):
+        add(value)
+    return _strings(*names[:int(limit)])
+
+
+# Most values a thing must be related to at once; each one past the first is a DAS query.
+CONJUNCTION_MAX_VALUES = 3
+
+
+def _asked_kind(message):
+    """The kind of thing a question asks for, as in 'which team' or 'what cities': {team} or {city, cities}."""
+    match = re.search(r"\b(?:which|what)\s+(\w+)", _latest_text(message), re.IGNORECASE)
+    if not match:
+        return set()
+    kind = fact_token(match.group(1))
+    return {kind, kind[:-1] if kind.endswith("s") else kind + "s"}
+
+
+def _entry_values(reply, tag, message=""):
+    """The '|'-separated values of the first TAG entry with at least two of them, lowercase.
+
+    The kind of thing asked for is not a value: "which team" gives no team.
+    """
+    kind = _asked_kind(message)
+    for entry in _extraction_entries(reply, tag):
+        values = []
+        for field in _plain_text(entry).split("|"):
+            value = " ".join(_fact_words(field))
+            if value and value not in FACT_PLACEHOLDERS and value not in kind and value not in values:
+                values.append(value)
+        if len(values) >= 2:
+            return values[:CONJUNCTION_MAX_VALUES]
+    return []
+
+
+def extracted_conjunction(reply, message=""):
+    """The values of an ALL entry (a question joining conditions with and) as ("v1" "v2"), or ()."""
+    values = _entry_values(reply, "ALL", message)
+    return _strings(*values) if values else "()"
+
+
+def _value_spellings(value, message):
+    """The forms a condition value may be stored under: lowercase, as spelled in the message,
+    and for several words each word on its own, as "2009 championship" is most likely stored as "2009"."""
+    spellings = []
+
+    def add(spelling):
+        if spelling and spelling not in spellings:
+            spellings.append(spelling)
+        match = re.search(re.escape(spelling), _latest_text(message), re.IGNORECASE) if spelling else None
+        if match:
+            add_plain(match.group(0))
+
+    def add_plain(spelling):
+        if spelling and spelling not in spellings:
+            spellings.append(spelling)
+
+    add(value)
+    words = value.split()
+    if len(words) > 1:
+        for word in words:
+            if word not in FACT_STOPWORDS and (len(word) >= 3 or word.isdigit()):
+                add(word)
+    return spellings
+
+
+def _value_matches(stored, value, message):
+    """True when a stored value is one of the forms of a condition value."""
+    return stored.lower() in {spelling.lower() for spelling in _value_spellings(value, message)}
+
+
+def conjunction_queries(values, message=""):
+    """DAS queries for a subject related to every value, as ((pattern template) ...).
+
+    A pattern is one conjunction of two bare Evaluation clauses sharing the
+    subject, whatever their relations are, so it reads learned facts and facts
+    written by other agents alike. The router takes two clauses per conjunction,
+    so each value past the first is paired with the first and conjunction_facts
+    keeps the subjects seen with all of them. The template gives the two facts
+    in the recall tuple form. Each value is tried lowercase and as spelled in
+    the message.
+    """
+    values = re.findall(r'"([^"]*)"', str(values or ""))
+    if len(values) < 2:
+        return "()"
+    pairs = []
+    for other in values[1:]:
+        for first in _value_spellings(values[0], message):
+            for second in _value_spellings(other, message):
+                clauses = [("$r1", first), ("$r2", second)]
+                pattern = "(, " + " ".join(f"(Evaluation (Predicate {r}) (List (Concept $s) (Concept {metta_string(v)})))"
+                                           for r, v in clauses) + ")"
+                template = "(" + " ".join(f'($s {r} {metta_string(v)} "" "")' for r, v in clauses) + ")"
+                pairs.append(f"({pattern} {template})")
+    return f"({' '.join(pairs)})"
+
+
+def conjunction_facts(facts, values, message=""):
+    """The recalled facts whose subject is related to every value, in any of the value's forms."""
+    wanted = re.findall(r'"([^"]*)"', str(values or ""))
+    by_subject = {}
+    for fact in _fact_tuples(facts):
+        by_subject.setdefault(fact[0], []).append(fact)
+    kept = [fact for subject_facts in by_subject.values()
+            if all(any(_value_matches(fact[2], value, message) for fact in subject_facts) for value in wanted)
+            for fact in subject_facts]
+    return "(" + " ".join(_strings(*fact) for fact in kept) + ")"
+
+
+def fact_index_text(subject, relation, value):
+    """The document a learned fact is stored under in the embedding index."""
+    return f"FACT {subject} | {relation} | {value}"
+
+
+def indexed_fact_subjects(results, limit=3):
+    """Subjects of FACT documents in a Chroma query result, most similar first."""
+    subjects = []
+    for match in re.finditer(r"FACT\s+([^|]+?)\s*\|", _plain_text(results)):
+        subject = " ".join(_fact_words(match.group(1)))
+        if subject and subject not in subjects:
+            subjects.append(subject)
+    return _strings(*subjects[:int(limit)])
+
+
+def recall_keys(message, lookups, indexed, limit=3):
+    """Concept names besides the speaker to query for a message: LOOKUP names, then index
+    hits, then capitalised message words when the extraction gave no LOOKUP; at most limit."""
+    speaker = message_speaker(message)
+    names = []
+    lookups = re.findall(r'"([^"]*)"', str(lookups or ""))
+    indexed = re.findall(r'"([^"]*)"', str(indexed or ""))
+    fallback = [] if lookups else re.findall(r'"([^"]*)"', fact_query_keys(message, limit, names_only=True))
+    for name in lookups + indexed + fallback:
+        if name and name != speaker and name not in names and len(names) < int(limit):
+            names.append(name)
+    return _strings(*names)
 
 
 FACT_VERB_RELATIONS = ("is", "are", "has", "have", "likes", "loves", "hates", "owns", "lives", "works")
@@ -301,6 +619,10 @@ def _second_person(verb):
 
 def _fact_sentence(subject, relation, value, speaker):
     relation, value = relation.replace("_", " "), value.replace("_", " ")
+    words = relation.split()
+    # "population is" reads as "population is is" once the sentence adds its own verb.
+    if len(words) > 1 and words[-1] in ("is", "are"):
+        relation = " ".join(words[:-1])
     verb, _, rest = relation.partition(" ")
     if verb in FACT_VERB_RELATIONS:
         if subject == speaker:
@@ -310,23 +632,56 @@ def _fact_sentence(subject, relation, value, speaker):
     return f"{owner} {relation} is {value}"
 
 
+def _fact_source(who, when, speaker):
+    if not who:
+        return ""
+    teller = "you" if who == speaker else who
+    return f" (said by {teller} on {when})" if when else f" (said by {teller})"
+
+
+def _fact_tuples(facts):
+    """Recall tuples in a MeTTa list as (subject, relation, value, who, when), who and when empty when absent.
+
+    The relation is accepted quoted or as a bare symbol, which older stored facts used.
+    """
+    found = re.findall(r'\(\s*"([^"]*)"\s+(?:"([^"]*)"|([^\s()"]+))\s+"([^"]*)"(?:\s+"([^"]*)"\s+"([^"]*)")?\s*\)',
+                       str(facts or ""))
+    return [(s, quoted or bare, v, who, when) for s, quoted, bare, v, who, when in found]
+
+
 def describe_facts(facts, message=""):
-    """Recalled ("subject" relation "value") triples as sentences addressed to the message sender."""
+    """Recalled facts as sentences addressed to the message sender.
+
+    A fact is ("subject" relation "value") or, with its provenance,
+    ("subject" relation "value" "who" "when"); the source is kept so the agent
+    can say who told it what, and when. The newest facts come first, so when
+    a relation holds several values the latest statement is read first.
+    """
     speaker = message_speaker(message)
-    triples = re.findall(r'\(\s*"([^"]*)"\s+([^\s()"]+)\s+"([^"]*)"\s*\)', str(facts or ""))
-    if not triples:
+    found = _fact_tuples(facts)
+    if not found:
         return "none"
-    return "; ".join(_fact_sentence(subject, relation, value, speaker)
-                     for subject, relation, value in triples) + "."
+    found.sort(key=lambda fact: fact[4], reverse=True)
+    return "; ".join(_fact_sentence(subject, relation, value, speaker) + _fact_source(who, when, speaker)
+                     for subject, relation, value, who, when in found) + "."
 
 
-def fact_query_keys(message, limit=3):
-    """Concept names to look up for a message: the speaker, then up to limit content words, names first."""
+def fact_query_keys(message, limit=3, names_only=False):
+    """Concept names to look up for a message: the speaker, then up to limit content words, names first.
+
+    names_only keeps capitalised words alone, for the fallback when the extraction named
+    nothing: each key costs two DAS queries, so common words are not worth asking for.
+    """
     speaker = message_speaker(message)
-    words = re.findall(r"[^\W_][\w./@+-]*", _latest_text(message))
+    text = _latest_text(message)
+    words = re.findall(r"[^\W_][\w./@+-]*", text)
+    # The first word of a message is capitalised whatever it is, so alone it is not a name.
+    first = words[0] if words else ""
     candidates = []
     for word in sorted(words, key=lambda word: not word[0].isupper()):
         key = fact_token(word)
+        if names_only and (not word[0].isupper() or (word == first and words.count(word) == 1)):
+            continue
         if len(key) >= 3 and key not in FACT_STOPWORDS and key != speaker and key not in candidates:
             candidates.append(key)
     return _strings(*([speaker] if speaker else []), *candidates[:int(limit)])
@@ -432,6 +787,13 @@ def normalize_string(x):
     except Exception as e:
         logger.debug(f"Could not normalize value, using its plain string form: {e}")
         return str(x)
+
+def getenv(key, default=""):
+    return os.environ.get(str(key), default)
+
+def is_set(x):
+    """True when x is non-empty text. A MeTTa bool reaches Python as text, so no flag argument."""
+    return x is not None and bool(str(x).strip())
 
 def joinPath(parts):
     return os.path.join(*parts)

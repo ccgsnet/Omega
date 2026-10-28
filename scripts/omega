@@ -658,6 +658,8 @@ help() {
     echo -e "\t-t <channel type> set communication channel type: irc|telegram|slack|websocket|mattermost|test"
     echo -e "\t-d <Docker image> set Docker image name (default omega:latest)"
     echo -e "\t-l <logging config> set Python logging config file"
+    echo -e "\t--das <host:port> DAS Command Router backing the agent's fact and belief memory"
+    echo -e "\t              (for example host.docker.internal:40009); without it memory is in-process"
     echo -e "\t--version, -v show the Omega version"
     echo -e "\t--help, -h show this help"
     echo
@@ -701,6 +703,7 @@ options() {
     memory_import_only_history=0
     memory_import_only_vector=0
     memory_export_enabled=0
+    das_router="${OMEGA_DAS_ROUTER:-}"
 
     if [[ "$#" -eq 0 ]]; then
         help
@@ -721,7 +724,7 @@ options() {
             -d?*) image=${1:2}; shift; continue;;
             -l?*) log_config_path=${1:2}; shift; continue;;
             -m?*) model=${1:2}; shift; continue;;
-            -s|-t|-p|-u|-g|-c|-d|-l|-m|--memory-transfer-dir|--memory-transfer-gid|--memory-import|--memory-mode)
+            -s|-t|-p|-u|-g|-c|-d|-l|-m|--das|--memory-transfer-dir|--memory-transfer-gid|--memory-import|--memory-mode)
                 require_option_value "${1}" "${2:-}" || return 1
                 ;;
         esac
@@ -735,6 +738,7 @@ options() {
             -d) image=${2}; shift 2;;
             -l) log_config_path=${2}; shift 2;;
             -m) model=${2}; shift 2;;
+            --das) das_router=${2}; shift 2;;
             --memory-transfer-dir)
                 memory_transfer_dir="${2}"
                 shift 2
@@ -1046,6 +1050,10 @@ start() {
 
     if [ -n "${openaiapi_url:-}" ]; then
       docker_cmd+=("openaiapi_url=${openaiapi_url}")
+    fi
+
+    if [ -n "${das_router:-}" ]; then
+      docker_cmd+=("dasRouter=${das_router}")
     fi
 
     if [ -n "${openclaw_url:-}" ]; then

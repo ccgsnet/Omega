@@ -7,6 +7,8 @@
 (= (wakeupInterval) (empty))
 (= (memoryDirectory) (empty))
 (= (spamShield) (empty)) ; TODO: this parameter is considered deprecated
+(= (autoLearnFacts) (empty))
+(= (factExtractionTokens) (empty))
 
 (= (initLoop)
    (progn (configure maxNewInputLoops 50) ;20
@@ -17,6 +19,8 @@
           (configure maxOutputToken 6000)
           (configure reasoningMode medium)
           (configure wakeupInterval 600) ;600=10 minutes
+          (configure autoLearnFacts True)
+          (configure factExtractionTokens 4000)
           (configure memoryDirectory
                (joinPath ((py-call (helper.projectRootDirectory)) memory)))
           (change-state! &prevmsg "")
@@ -31,20 +35,46 @@
 ; results with other skills before replying.
 (= (maxReplyTurns) 5)
 
-; Facts a user states are extracted by a separate model call and stored before
-; the agent sees the message, so storing them does not depend on the agent
-; choosing the learn skill.
-(= (autoLearnFacts) True)
+; Facts a user states and the names a user asks about are extracted by one
+; separate model call before the agent sees the message, so storing and recall
+; do not depend on the agent choosing a skill. Messages that can state or ask
+; nothing, such as auth, skill calls and short acknowledgements, skip the call.
+(= (extract-from-message $msg)
+   (if (and (autoLearnFacts) (py-call (helper.needs_fact_extraction $msg)))
+       (case (catch (llmProviderChat (py-call (helper.fact_extraction_prompt $msg))
+                                     (factExtractionTokens) (reasoningMode)))
+         (((Error $type $ctx) (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED $type)) "NONE"))
+          ((Error $type) (progn (log WARNING "das-memory" (FACTS_NOT_EXTRACTED $type)) "NONE"))
+          ($reply $reply)))
+       "NONE"))
 
-(= (learn-from-message $msg)
-   (if (autoLearnFacts)
-       (das-log-failure FACTS_NOT_LEARNED
-         (catch (let $reply (llmProviderChat (py-call (helper.fact_extraction_prompt $msg))
-                                             (maxOutputToken) (reasoningMode))
-                  (let $learned (learn-all $reply)
-                    (progn (log INFO "das-memory" (FACTS_EXTRACTED: $reply LEARNED: $learned))
-                           $learned)))))
-       ()))
+(= (learn-from-reply $reply)
+   (das-log-failure FACTS_NOT_LEARNED
+     (catch (let $learned (learn-all $reply)
+              (progn (map-atom $learned $fact (index-fact $fact))
+                     (log INFO "das-memory" (FACTS_EXTRACTED: $reply LEARNED: $learned))
+                     $learned)))))
+
+; The names queried in DAS for a message besides the sender: the LOOKUP names,
+; the subjects of the nearest indexed facts, and capitalised message words only
+; when the extraction named nothing.
+(= (recall-keys $msg $reply)
+   (sread (py-call (helper.recall_keys $msg
+                                       (py-call (helper.extracted_lookups $reply $msg (maxFactConcepts)))
+                                       (indexed-fact-keys $msg (maxFactConcepts))
+                                       (maxFactConcepts)))))
+
+; Facts are recalled by name, and a question that joins conditions with and
+; also runs one DAS conjunction over its values (ALL in the extraction reply);
+; a question joining them with or looks up each value (ANY), which is the
+; union of their facts.
+(= (remember-message $msg)
+   (let* (($reply (extract-from-message $msg))
+          ($_ (learn-from-reply $reply))
+          ($speaker (sread (py-call (helper.speaker_literal $msg))))
+          ($facts (recall-facts-for $speaker (recall-keys $msg $reply)))
+          ($joint (conjunction-facts (sread (py-call (helper.extracted_conjunction $reply $msg))))))
+     (change-state! &knownFacts (describe-facts (unique-atom (union-atom $facts $joint)) $msg))))
 
 ; Small models often send idle chatter such as "No new user input." despite the
 ; prompt, so a send is only run while a user message is waiting for a reply.
@@ -70,7 +100,7 @@
                          " KNOWN_FACTS are learned facts related to the user message, written to the user: your means the user's, never yours." (newline)
                          " Facts the user states are learned automatically: acknowledge them with send." (newline)
                          " Answer questions from KNOWN_FACTS in the same person, for example: Your favorite color is blue. Never invent a fact that is not there." (newline)
-                         " Use learn or unlearn only to correct a fact." (newline)
+                         " Use unlearn only to remove a fact that is no longer true." (newline)
                          " SAVE_PERMANENT_FILES_DIR: " (memoryDirectory)
                          " LAST_SKILL_USE_RESULTS: " (last_chars (get-state &lastresults) (maxFeedback))
                          " HISTORY: " (getHistory) 
@@ -104,6 +134,7 @@
                                (initLogger)
                                (applySecurityPolicy)
                                (initMemory)
+                               (das-health)
                                (initKnowledge)
                                (initPlugins)
                                (initChannels)
@@ -122,8 +153,7 @@
                                      (change-state! &loops (maxNewInputLoops)) _)))
                             (if (> (get-state &loops) 0)
                                 (let* (($gathered (get-state &pendingResults))
-                                       ($_ (if $msgnew (learn-from-message $msg) _))
-                                       ($_ (if $msgnew (change-state! &knownFacts (describe-facts (recall-facts $msg) $msg)) _))
+                                       ($_ (if $msgnew (remember-message $msg) _))
                                        ($facts (get-state &knownFacts))
                                        ($replyopen (or $msgnew (> (get-state &replyTurns) 0)))
                                        ($lastmessage (if $msgnew

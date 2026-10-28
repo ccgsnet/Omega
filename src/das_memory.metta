@@ -3,19 +3,27 @@
 ; add-atom and remove-atom take their arguments as data: a parsed atom must be
 ; bound by let first, or the unevaluated (sread ...) call is stored instead.
 ; DAS cannot match a bare variable (das_space_no_dump), so every pattern here
-; names a relation.
+; names a relation. The router has two more limits the skills guard against:
+; an add_atom or delete_atom whose atom contains a variable has crashed the
+; HTTP server, and a query without a variable is rejected.
 
 (= (das-store $str)
    (let $atom (sread $str)
-     (add-atom &das $atom)))
+     (if (is-ground $atom)
+         (add-atom &das $atom)
+         (DAS_STORE_REJECTED "an atom with variables cannot be stored" $atom))))
 
 (= (das-recall $str)
    (let $pattern (sread $str)
-     (collapse (match &das $pattern $pattern))))
+     (if (is-ground $pattern)
+         (DAS_RECALL_REJECTED "a query needs a variable such as $1; to check one fact match it as a belief: beliefs <fact>" $pattern)
+         (collapse (match &das $pattern $pattern)))))
 
 (= (das-forget $str)
    (let $atom (sread $str)
-     (remove-atom &das $atom)))
+     (if (is-ground $atom)
+         (remove-atom &das $atom)
+         (DAS_FORGET_REJECTED "an atom with variables cannot be removed" $atom))))
 
 ; NAL and PLN knowledge is kept as (Belief <term> (stv f c)), at most one
 ; truth value per term. A different truth for a known term is merged with
@@ -73,14 +81,35 @@
 (= (remember-inference $code $result)
    (das-log-failure BELIEFS_NOT_STORED (catch (store-inference $code $result))))
 
-(= (das-remember $time $str)
-   (das-log-failure MEMORY_NOT_STORED (catch (add-atom &das (Memory $time $str)))))
+; host:port of the DAS Command Router, "" for none. Read directly so run.metta
+; can bind &das before the loop configures anything.
+(= (dasEndpoint)
+   (py-call (helper.normalize_string (configGetByKey dasRouter ""))))
 
-; Plain-language facts from conversation, in the DAS knowledge-base shape
-; (Evaluation (Predicate (relation "value")) (Concept "subject")), the form DAS
-; Sql2AtomsMapper gives a column value. A subject has at most one value per
-; relation: a new value replaces the old one.
-; DAS has no text search, so facts are recalled by exact subject name.
+(= (dasConfigured)
+   (py-call (helper.is_set (dasEndpoint))))
+
+; GET /ping tells an HTTP server that is down from a query that fails, then a
+; query that names a relation, so an unreachable router fails here and not in
+; the first user turn.
+(= (das-health)
+   (if (py-call (helper.das_ping (dasEndpoint)))
+       (case (catch (collapse (match &das (Belief (Evaluation (Predicate $r) (List (Concept "__health__") (Concept $v))) $tv) $r)))
+         (((Error $type $ctx) (progn (log WARNING "das-memory" (DAS_UNREACHABLE $type)) False))
+          ((Error $type) (progn (log WARNING "das-memory" (DAS_UNREACHABLE $type)) False))
+          ($ok (progn (log INFO "das-memory" "DAS space answers queries") True))))
+       (progn (log WARNING "das-memory" (DAS_HTTP_DOWN (dasEndpoint) "GET /ping did not answer PONG")) False)))
+
+; Plain-language facts from conversation are beliefs over the binary PLN form
+; (Evaluation (Predicate "relation") (List (Concept "subject") (Concept "value"))),
+; the shape the lib_pln rules match, so a learned fact is a premise for |~ and
+; (beliefs "(Evaluation (Predicate \"capital\") (List (Concept \"brazil\") $1))")
+; finds it. The nested Evaluation is itself a link in DAS, so other agents on
+; the same router find the fact with a bare Evaluation pattern; the string
+; predicate name and lowercase concept names are the convention shared with them. A relation may hold several values ("human similar_to monkey" and
+; "human similar_to chimp" are both true), so a new value is added beside the
+; old ones and nothing is forgotten without unlearn; recall lists the newest
+; first. Each fact carries (Stated term "nick" "time") provenance.
 
 (= (current-message)
    (case (catch (get-state &prevmsg))
@@ -88,23 +117,41 @@
       ((Error $type) "")
       ($msg $msg))))
 
-; Predicate is also a PeTTa builtin that builds Prolog terms, so an Evaluation
-; atom may only appear where it is not evaluated: add-atom, remove-atom and
-; match patterns. Results are reported as (LEARNED subject relation value).
+; The truth given to a fact a user states.
+(= (factTruth) (stv 1.0 0.9))
+
+; Predicate is also a PeTTa builtin that builds Prolog terms, so the fact term
+; is parsed from text and only ever bound by let or placed in add-atom,
+; remove-atom and match patterns. learn reports (LEARNED subject relation value)
+; for a new fact and (KNOWN subject relation value) for one already stored.
+
+(= (fact-term $s $r $v)
+   (sread (py-call (helper.fact_term $s $r $v))))
 
 (= (relation-values $s $r)
-   (collapse (match &das (Evaluation (Predicate ($r $found)) (Concept $s)) $found)))
+   (collapse (match &das (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $tv) $found)))
 
+; In DAS the Evaluation nested in a removed Belief stays as a link of its own
+; and would be read back as a fact from another agent, so it is removed too;
+; in a local space it is not a separate atom and the removal is a no-op.
 (= (forget-value $s $r $v)
-   (remove-atom &das (Evaluation (Predicate ($r $v)) (Concept $s))))
+   (let $term (fact-term $s $r $v)
+     (progn (map-atom (collapse (match &das (Belief $term $tv) $tv)) $tv (remove-atom &das (Belief $term $tv)))
+            (map-atom (collapse (match &das (Stated $term $who $when) ($who $when))) $p
+                      (let ($who $when) $p (remove-atom &das (Stated $term $who $when))))
+            (catch (remove-atom &das $term)))))
 
 (= (store-fact $s $r $v)
    (let $old (relation-values $s $r)
      (if (is-member $v $old)
-         (LEARNED $s $r $v)
-         (progn (map-atom $old $stale (forget-value $s $r $stale))
-                (add-atom &das (Evaluation (Predicate ($r $v)) (Concept $s)))
-                (LEARNED $s $r $v)))))
+         (KNOWN $s $r $v)
+         (let* (($term (fact-term $s $r $v))
+                ($tv (factTruth))
+                ($who (sread (py-call (helper.speaker_literal (current-message)))))
+                ($when (get_time_as_string))
+                ($_ (add-atom &das (Belief $term $tv)))
+                ($_ (add-atom &das (Stated $term $who $when))))
+           (LEARNED $s $r $v)))))
 
 (= (learn $str)
    (case (sread (py-call (helper.parse_fact $str (current-message))))
@@ -124,13 +171,83 @@
 (= (describe-facts $facts $msg)
    (py-call (helper.describe_facts (repr $facts) $msg)))
 
-; One DAS query per concept name, so the number of names bounds the delay per message.
+; Concept names looked up per message besides the sender. Each name is three
+; DAS queries, as subject, as value and as subject of a three-place record,
+; so this bounds the delay per message.
 (= (maxFactConcepts) 3)
 
+; Facts about $key and facts whose value is $key, with their provenance, as
+; ("subject" relation "value" "who" "when"). Recall reads the Stated links:
+; every learned fact has one, and it answers "who told you that?" and "when?"
+; with no further query.
+; When no Stated link names the key, the bare Evaluation form is tried: that
+; is what other agents on the same router write, with no source, and also
+; where beliefs derived by |- or |~ end up. Other agents keep the spelling of
+; the user, so the key is tried as written in the message and in Title Case
+; besides lowercase. These are more queries, so they run only on a miss.
+; A three-place record (subject, value, value) is read as one value.
+; A user function inside a superpose list is collected as one list, so the
+; match calls are written out.
+(= (stated-facts-about $key)
+   (collapse (superpose ((match &das (Stated (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) $who $when) ($key $r $v $who $when))
+                         (match &das (Stated (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) $who $when) ($s $r $key $who $when))
+                         (match &das (Stated (Evaluation (Predicate $r) (List (Concept $key) (Concept $v) (Concept $w))) $who $when)
+                                (let $joined (sread (py-call (helper.join_values $v $w))) ($key $r $joined $who $when)))))))
+
+; superpose takes a bound list, not a call: the variants are bound first.
+(= (external-facts-about $key)
+   (let $names (sread (py-call (helper.name_variants $key (current-message))))
+     (let $name (superpose $names)
+       (superpose ((match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" ""))
+                   (match &das (Evaluation (Predicate $r) (List (Concept $s) (Concept $name))) ($s $r $name "" ""))
+                   (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v) (Concept $w)))
+                          (let $joined (sread (py-call (helper.join_values $v $w))) ($name $r $joined "" ""))))))))
+
+(= (facts-about $key)
+   (let $stated (stated-facts-about $key)
+     (if (== $stated ())
+         (external-facts-about $key)
+         (superpose $stated))))
+
+; Arguments are evaluated before a call, so the nondeterministic query must be
+; collapsed inside the function that logs a failure, not passed to one.
+(= (recall-failure $rc)
+   (case $rc
+     (((Error $type $ctx) (progn (log WARNING "das-memory" (FACTS_NOT_RECALLED $type)) ()))
+      ((Error $type) (progn (log WARNING "das-memory" (FACTS_NOT_RECALLED $type)) ()))
+      ($facts $facts))))
+
+(= (recall-facts-by-keys $keys)
+   (recall-failure (catch (unique-atom (collapse (let $key (superpose $keys) (facts-about $key)))))))
+
+; The sender is looked up as a subject only; the other names from both sides.
+(= (recall-facts-for $speaker $keys)
+   (recall-failure
+     (catch (unique-atom (collapse (superpose ((match &das (Stated (Evaluation (Predicate $r) (List (Concept $speaker) (Concept $v))) $who $when) ($speaker $r $v $who $when))
+                                               (let $key (superpose $keys) (facts-about $key)))))))))
+
+; A question about something that must meet several conditions at once, such
+; as "which team has a blue logo and won in 2009", is extracted as
+; ALL blue | 2009 and answered by one DAS conjunction: a subject related to
+; both values, whatever the relation names. The matched facts join the
+; recalled ones, so the agent reads "team a's logo color is blue; team a's
+; won national championship is 2009" and does not have to write a query.
+; The router accepts a conjunction of two clauses, and a nested one answers
+; but the client returns nothing, so a third value is paired with the first
+; and conjunction_facts keeps the subjects seen with every value.
+; The queries are built as text and read with sread, so the shared $s binds
+; across the clauses of each pattern.
+(= (conjunction-facts $values)
+   (if (== $values ())
+       ()
+       (let $queries (sread (py-call (helper.conjunction_queries (repr $values) (current-message))))
+         (let $found (recall-failure
+                       (catch (unique-atom (collapse (let ($pattern $template) (superpose $queries)
+                                                       (let $facts (match &das $pattern $template) (superpose $facts)))))))
+           (let $kept (sread (py-call (helper.conjunction_facts (repr $found) (repr $values) (current-message))))
+             (progn (log INFO "das-memory" (DAS_CONJUNCTION $values FOUND: $kept))
+                    $kept))))))
+
+; Recall from the words of the message alone, used when no extraction reply is available.
 (= (recall-facts $msg)
-   (let $keys (sread (py-call (helper.fact_query_keys $msg (maxFactConcepts))))
-     (case (catch (unique-atom (collapse (let $key (superpose $keys)
-                                           (match &das (Evaluation (Predicate ($r $v)) (Concept $key)) ($key $r $v))))))
-       (((Error $type $ctx) (progn (log WARNING "das-memory" (FACTS_NOT_RECALLED $type)) ()))
-        ((Error $type) (progn (log WARNING "das-memory" (FACTS_NOT_RECALLED $type)) ()))
-        ($facts $facts)))))
+   (recall-facts-by-keys (sread (py-call (helper.fact_query_keys $msg (maxFactConcepts))))))

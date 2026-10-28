@@ -44,6 +44,17 @@ embeddingModel: ""
 # Enable authenticated operator-triggered /memory-export commands (disabled by default).
 memoryExportEnabled: false
 
+# DAS
+
+# host:port of the DAS Command Router that backs the `&das` space (facts and beliefs),
+# for example "host.docker.internal:40009"; `scripts/omega start --das <host:port>` sets it.
+# Empty keeps `&das` as an in-process space that does not persist across restarts.
+dasRouter: ""
+# Extract facts and lookup names from each user message with a separate model call
+autoLearnFacts: True
+# Output cap passed to the provider for that extraction call; reasoning models spend most of it thinking
+factExtractionTokens: 4000
+
 # Policy
 
 # Path to the security profile written using [OpenShell YAML](https://docs.nvidia.com/openshell/reference/policy-schema#filesystem-policy). See [./profile/policy.yaml](./profile/policy.yaml) as an example. Empty value disables restrictions.

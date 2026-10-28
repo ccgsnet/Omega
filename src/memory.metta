@@ -7,7 +7,7 @@
 
 (= (initMemory)
    (progn (log INFO "memory" "Initializing memory")
-          (log INFO "memory" "Beliefs, formal atoms and remembered text are also kept in the &das space")
+          (log INFO "memory" "Facts and beliefs are kept in the &das space, indexed for similarity in Chroma")
           (configure maxFeedback 50000)
           (configure maxRecallItems 20)
           (configure maxEpisodeRecallLines 20)
@@ -51,15 +51,31 @@
 (= (appendToHistory $addition)
    (append-file-raw (library Omega ./memory/history.metta) (swrite $addition)))
 
-; Chroma answers similarity queries; DAS keeps the same text as a (Memory time text) atom.
 (= (remember $str)
-   (let $time (get_time_as_string)
-     (progn (py-call (lib_chromadb.remember $str (embed $str) $time))
-            (das-remember $time $str)
-            REMEMBER-SUCCESS)))
+   (progn (py-call (lib_chromadb.remember $str (embed $str) (get_time_as_string)))
+          REMEMBER-SUCCESS))
 
 (= (query $str)
    (py-call (lib_chromadb.query (embed $str) (maxRecallItems))))
+
+; Chroma is the similarity index over the facts in DAS: a new fact is stored as
+; the document "FACT subject | relation | value", and a message's nearest FACT
+; documents give the subjects to query in DAS. DAS stays the source of truth,
+; so a document whose fact was unlearned only costs one empty query.
+(= (index-fact $learned)
+   (case $learned
+     (((LEARNED $s $r $v)
+       (das-log-failure FACT_NOT_INDEXED
+         (catch (let $doc (py-call (helper.fact_index_text $s $r $v))
+                  (progn (py-call (lib_chromadb.remember $doc (embed $doc) (get_time_as_string)))
+                         (INDEXED $s $r $v))))))
+      ($other $other))))
+
+(= (indexed-fact-keys $msg $limit)
+   (case (catch (py-call (helper.indexed_fact_subjects (repr (query $msg)) $limit)))
+     (((Error $type $ctx) (progn (log WARNING "memory" (FACT_INDEX_NOT_QUERIED $type)) "()"))
+      ((Error $type) (progn (log WARNING "memory" (FACT_INDEX_NOT_QUERIED $type)) "()"))
+      ($keys $keys))))
 
 (= (episodes $time)
    (py-call (helper.around_time $time (maxEpisodeRecallLines))))

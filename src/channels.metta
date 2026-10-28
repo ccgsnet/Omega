@@ -20,10 +20,16 @@
 (= (receive)
    (commChannelReceive))
 
-;Send a message to all communication channels:
+;Send a message to all communication channels. The text is cleaned of the
+;format noise small models leak into replies (escape markers, quotes around
+;the whole answer, an appended skill call, the user's question repeated) and
+;nothing is sent when nothing is left.
 !(change-state! &lastsend "")
 (= (send $msg)
-   (if (!= $msg (get-state &lastsend))
-       (progn (change-state! &lastsend $msg)
-              (let $safemsg (string-replace $msg  "\n" "\\n")
-                   (let $temp (cut) (commChannelSend $safemsg)))) _))
+   (let $reply (py-call (helper.clean_reply $msg (current-message)))
+     (if (py-call (helper.is_set $reply))
+         (if (!= $reply (get-state &lastsend))
+             (progn (change-state! &lastsend $reply)
+                    (let $safemsg (string-replace $reply "\n" "\\n")
+                         (let $temp (cut) (commChannelSend $safemsg)))) _)
+         (SEND_SKIPPED "empty reply"))))

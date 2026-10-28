@@ -36,6 +36,14 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | `embeddingprovider` | `Local` | `Local` (Python-side model), or the id of a provider that serves an OpenAI-compatible `/embeddings` endpoint — `OpenAI` and `ASICloud` are known to. The gateway supplies that provider's key. |
 | `embeddingModel` | empty | Model asked of a non-`Local` `embeddingprovider`. Empty means the provider default: `text-embedding-3-large` for `OpenAI`, `WhereIsAI/UAE-Large-V1` for `ASICloud`. |
 
+## DAS (`run.metta`, `src/das_memory.metta`, `src/loop.metta`)
+
+| Key | Default | Description |
+|---|---|---|
+| `dasRouter` | empty | `host:port` of the DAS Command Router that backs the `&das` space holding facts and beliefs, for example `host.docker.internal:40009`. `scripts/omega start --das <host:port>` sets it. Empty keeps `&das` an in-process space that does not persist across restarts. Read before the loop starts, so it must come from the command line, `OMEGA_dasRouter` or the config file. |
+| `autoLearnFacts` | `True` | Make one extra model call per user message to extract the facts it states (`FACT subject \| relation \| value`) and the names it asks about (`LOOKUP name`). |
+| `factExtractionTokens` | 4000 | Output cap passed to the provider for that extraction call. Reasoning models spend most of it thinking; at 1000 `ornith-1.5:9b` ran out before answering. |
+
 ## Channels (`src/channels.metta`, `initChannels`)
 
 | Parameter | Default | Meaning |

@@ -13,6 +13,7 @@ test_fileio_verified_writes.py: the module is loaded by file path.
 import datetime
 import importlib.util
 import os
+import re
 import sys
 
 import pytest
@@ -146,31 +147,31 @@ def test_answered_user_only_for_send_without_pending_results(helper):
     assert helper.answered_user(helper.balance_parentheses("beliefs (--> a $1)\nsend done")) is False
     assert helper.answered_user(helper.balance_parentheses("send")) is False
     assert helper.answered_user(helper.balance_parentheses("beliefs (--> a $1)")) is False
-    assert helper.answered_user(helper.balance_parentheses("learn I favorite_color purple\nsend Ok")) is True
+    assert helper.answered_user(helper.balance_parentheses("unlearn I | favorite_color\nsend Ok")) is True
 
 
 # --- facts ----------------------------------------------------------------
 
 def test_parse_fact_maps_self_words_to_the_speaker(helper):
     assert helper.parse_fact("I | favorite color | purple", "arturgontijo: my favorite color is purple") == (
-        '("arturgontijo" favorite_color "purple")'
+        '("arturgontijo" "favorite_color" "purple")'
     )
 
 
 def test_parse_fact_keeps_value_words_and_sanitizes_them(helper):
     assert helper.parse_fact("Paris | capital of | (France) $1", "") == (
-        '("paris" capital_of "france 1")'
+        '("paris" "capital_of" "france 1")'
     )
-    assert helper.parse_fact("I | favorite_color | Dark Blue", "") == '("user" favorite_color "dark blue")'
+    assert helper.parse_fact("I | favorite_color | Dark Blue", "") == '("user" "favorite_color" "dark blue")'
     assert helper.parse_fact("The capital of Brazil | population | more than one million", "") == (
-        '("capital of brazil" population "more than one million")'
+        '("capital of brazil" "population" "more than one million")'
     )
 
 
 def test_fact_text_keeps_non_ascii_letters_unescaped(helper):
-    assert helper.parse_fact("Brazil | capital | Brasília", "") == '("brazil" capital "brasília")'
+    assert helper.parse_fact("Brazil | capital | Brasília", "") == '("brazil" "capital" "brasília")'
     assert helper.parse_fact("São Paulo | população | doze milhões", "") == (
-        '("são paulo" população "doze milhões")'
+        '("são paulo" "população" "doze milhões")'
     )
     assert helper.extracted_facts("FACT Brazil | capital | Brasília") == '("Brazil | capital | Brasília")'
     assert helper.fact_query_keys("ana: Onde fica Brasília?", 3) == '("ana" "onde" "brasília" "fica")'
@@ -186,7 +187,7 @@ def test_parse_fact_rejects_sentences_and_long_fields(helper):
 
 
 def test_parse_fact_key_takes_subject_and_relation(helper):
-    assert helper.parse_fact_key("my | favorite color", "") == '("user" favorite_color)'
+    assert helper.parse_fact_key("my | favorite color", "") == '("user" "favorite_color")'
     assert helper.parse_fact_key("my favorite_color", "") == "()"
 
 
@@ -211,7 +212,7 @@ def test_extracted_facts_reads_fact_lines_and_fused_lines(helper):
 
 def test_describe_facts_addresses_the_sender_as_you(helper):
     facts = ('(("arturgontijo" favorite_color "blue") ("france" capital "paris") '
-             '("arturgontijo" lives_in "belo horizonte"))')
+             '("arturgontijo" "lives_in" "belo horizonte"))')
     assert helper.describe_facts(facts, "arturgontijo: what is my favorite color?") == (
         "your favorite color is blue; france's capital is paris; you live in belo horizonte."
     )
@@ -223,10 +224,197 @@ def test_describe_facts_addresses_the_sender_as_you(helper):
     assert helper.describe_facts("()", "bob: hi") == "none"
 
 
+def test_clean_reply_removes_format_noise_seen_in_chat(helper):
+    # Cases taken from IRC sessions with a 9B model.
+    assert helper.clean_reply('quote_The rule is recorded: cities with more than 500k people are big city."') == (
+        "The rule is recorded: cities with more than 500k people are big city."
+    )
+    assert helper.clean_reply(
+        '"Yes—understood. I\'ve recorded this rule." (learn arturgontijo | classification rule | mid-size)'
+    ) == "Yes—understood. I've recorded this rule."
+    assert helper.clean_reply(
+        "How can we classify Divinópolis city?\n\nDivinópolis, with around 250k people, is a mid-size city.",
+        "arturgontijo: How can we classify Divinópolis city?",
+    ) == "Divinópolis, with around 250k people, is a mid-size city."
+    assert helper.clean_reply(
+        "What can we say about the people who live in Divinópolis?\nPeople who live in Divinópolis are poor.",
+        "arturgontijo: What can we say about people that live there?",
+    ) == "People who live in Divinópolis are poor."
+    assert helper.clean_reply("Divinópolis_apostrophe_ people are poor_newline_Said by you.") == (
+        "Divinópolis' people are poor\nSaid by you."
+    )
+
+
+def test_clean_reply_keeps_ordinary_replies(helper):
+    assert helper.clean_reply("Do you mean the staging server?\nIt runs Ubuntu.", "bob: which server?") == (
+        "Do you mean the staging server?\nIt runs Ubuntu."
+    )
+    assert helper.clean_reply('He said "hi" and "bye".') == 'He said "hi" and "bye".'
+    assert helper.clean_reply("Run (shell ls) to list files.") == "Run (shell ls) to list files."
+    assert helper.clean_reply("Is this a question?", "bob: Is this a question?") == "Is this a question?"
+    assert helper.clean_reply('""') == ""
+    assert helper.clean_reply("  ") == ""
+
+
+def test_describe_facts_names_the_source_of_each_fact(helper):
+    facts = ('(("divinópolis" people "poor" "arturgontijo" "2026-10-23 13:38:48") '
+             '("divinópolis" "population_is" "around 250k" "ana" "2026-10-23 13:35:07"))')
+    assert helper.describe_facts(facts, "arturgontijo: who told you that?") == (
+        "divinópolis's people is poor (said by you on 2026-10-23 13:38:48); "
+        "divinópolis's population is around 250k (said by ana on 2026-10-23 13:35:07)."
+    )
+    assert helper.describe_facts('(("bob" is "tall" "bob" ""))', "ana: is bob tall?") == "bob is tall (said by bob)."
+
+
 def test_fact_query_keys_start_with_the_speaker_and_skip_stopwords(helper):
     message = "bob: hi | arturgontijo: What_apostrophe_s my favorite color of all?"
     assert helper.fact_query_keys(message, 3) == '("arturgontijo" "favorite" "color" "all")'
     assert helper.fact_query_keys("no speaker here at all", 2) == '("speaker" "here")'
+
+
+def test_parse_fact_rejects_placeholder_fields(helper):
+    assert helper.parse_fact("NONE | likes | purple", "bob: who likes purple?") == "()"
+    assert helper.parse_fact("I | likes | unknown", "bob: hi") == "()"
+    assert helper.extracted_lookups("LOOKUP none\nLOOKUP purple", "bob: q?") == '("purple")'
+
+
+def test_fact_term_is_the_binary_pln_evaluation(helper):
+    assert helper.fact_term("brazil", "capital", "brasília") == (
+        '(Evaluation (Predicate "capital") (List (Concept "brazil") (Concept "brasília")))'
+    )
+    assert helper.speaker_literal("ana: hi") == '"ana"'
+    assert helper.speaker_literal("no sender") == '"user"'
+
+
+def test_extracted_lookups_map_self_to_the_speaker_and_cap_the_count(helper):
+    reply = "LOOKUP I\nLOOKUP Brazil\nLOOKUP Brasilia (the capital)\nLOOKUP purple\nFACT I | dog | Rex"
+    assert helper.extracted_lookups(reply, "arturgontijo: q?", 3) == '("brazil" "brasilia" "purple")'
+    assert helper.extracted_lookups("NONE", "arturgontijo: q?") == "()"
+    assert helper.extracted_facts(reply) == '("I | dog | Rex")'
+
+
+def test_extracted_lookups_also_give_the_names_inside_a_longer_name(helper):
+    # "Divinópolis people" is stored under "divinópolis"; "staging server" has no name to split off.
+    assert helper.extracted_lookups("LOOKUP Divinópolis people", "bob: q?") == '("divinópolis people" "divinópolis")'
+    assert helper.extracted_lookups("LOOKUP The Acme team\nLOOKUP staging server", "bob: q?", 3) == (
+        '("acme team" "acme" "staging server")'
+    )
+
+
+def test_any_values_are_looked_up_like_names_and_all_values_make_a_conjunction(helper):
+    # OR: each value is a recall key; AND: the values of the first ALL line, at most three.
+    assert helper.extracted_lookups("ANY Ubuntu | Debian", "bob: Which servers run Ubuntu or Debian?") == '("ubuntu" "debian")'
+    assert helper.extracted_lookups("LOOKUP Ana\nANY tea | coffee", "bob: q?") == '("ana" "tea" "coffee")'
+    assert helper.extracted_conjunction("LOOKUP team\nALL blue | 2009") == '("blue" "2009")'
+    assert helper.extracted_conjunction("ALL Lisbon | Acme | tea | red") == '("lisbon" "acme" "tea")'
+    assert helper.extracted_conjunction("ALL blue") == "()"
+    assert helper.extracted_conjunction("ALL none | blue\nALL red | 2022") == '("red" "2022")'
+    assert helper.extracted_conjunction("LOOKUP Ana") == "()"
+    # The kind of thing asked for is not a condition, singular or plural.
+    message = "arturgontijo: Which team has its logo blue and have won the 2009 championship?"
+    assert helper.extracted_conjunction("ALL team | blue | 2009 championship", message) == '("blue" "2009 championship")'
+    assert helper.extracted_lookups("ANY teams | red | blue", "bob: Which team has red or blue jerseys?") == '("red" "blue")'
+    assert "ALL value | value" in helper.FACT_EXTRACTION_PROMPT and "ANY value | value" in helper.FACT_EXTRACTION_PROMPT
+
+
+def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(helper):
+    message = "arturgontijo: Which team has its logo blue and won the 2009 championship?"
+    assert helper.conjunction_queries('("blue" "2009")', message) == (
+        '(((, (Evaluation (Predicate $r1) (List (Concept $s) (Concept "blue")))'
+        ' (Evaluation (Predicate $r2) (List (Concept $s) (Concept "2009"))))'
+        ' (($s $r1 "blue" "" "") ($s $r2 "2009" "" ""))))'
+    )
+    # A value spelled with capitals in the message is tried that way too; a third value pairs with the first.
+    queries = helper.conjunction_queries('("lisbon" "acme" "tea")', "bob: Who lives in Lisbon, works at Acme and likes tea?")
+    patterns = queries.split("((, ")[1:]
+    assert len(patterns) == 6
+    assert '(Concept "Lisbon")' in queries and '(Concept "Acme")' in queries
+    assert all(p.count("(Evaluation") == 2 for p in patterns)
+    # A value of several words is also tried word by word, as it is most likely stored as one of them.
+    queries = helper.conjunction_queries('("blue" "2009 championship")', message)
+    assert [m.group(1) for m in re.finditer(r'\$r2\) \(List \(Concept \$s\) \(Concept "([^"]*)"', queries)] == [
+        "2009 championship", "2009", "championship"]
+    assert helper.conjunction_queries('("blue")', message) == "()"
+
+
+def test_conjunction_facts_keep_only_subjects_related_to_every_value(helper):
+    facts = ('(("Team A" "logo_color" "blue" "" "") ("Team A" "won_national_championship" "2009" "" "")'
+             ' ("Team B" "jersey_color" "blue" "" "") ("Team B" "founded_year" "1982" "" ""))')
+    assert helper.conjunction_facts(facts, '("blue" "2009")') == (
+        '(("Team A" "logo_color" "blue" "" "") ("Team A" "won_national_championship" "2009" "" ""))'
+    )
+    # The message spelling and a word of a longer value count as the same value.
+    assert helper.conjunction_facts('(("ana" "lives_in" "Lisbon" "" "") ("ana" "works_at" "acme" "" ""))',
+                                    '("lisbon" "acme")') == '(("ana" "lives_in" "Lisbon" "" "") ("ana" "works_at" "acme" "" ""))'
+    assert helper.conjunction_facts(facts, '("blue" "2009 championship")', "bob: who won the 2009 championship?") == (
+        '(("Team A" "logo_color" "blue" "" "") ("Team A" "won_national_championship" "2009" "" ""))'
+    )
+    assert helper.conjunction_facts(facts, '("blue" "1982")') == (
+        '(("Team B" "jersey_color" "blue" "" "") ("Team B" "founded_year" "1982" "" ""))'
+    )
+    assert helper.conjunction_facts(facts, '("blue" "2022")') == "()"
+    assert helper.conjunction_facts("()", '("blue" "2009")') == "()"
+
+
+def test_needs_fact_extraction_skips_commands_and_short_acknowledgements(helper):
+    assert helper.needs_fact_extraction("arturgontijo: My favorite color is blue")
+    assert helper.needs_fact_extraction("arturgontijo: Brasília?")
+    assert not helper.needs_fact_extraction("arturgontijo: ok thanks")
+    assert not helper.needs_fact_extraction("arturgontijo: auth choose-a-secret")
+    assert not helper.needs_fact_extraction("arturgontijo: metta (+ 1 2)")
+    assert not helper.needs_fact_extraction("")
+
+
+def test_fact_index_round_trip(helper):
+    doc = helper.fact_index_text("brazil", "capital", "brasília")
+    assert doc == "FACT brazil | capital | brasília"
+    results = f'[["2026-10-23 08:00:00", "{doc}"], ["2026-10-22 09:00:00", "a note"], ' \
+              '["2026-10-22 09:00:00", "FACT Divinópolis | population | 250k"]]'
+    assert helper.indexed_fact_subjects(results, 3) == '("brazil" "divinópolis")'
+    assert helper.indexed_fact_subjects("[]") == "()"
+
+
+def test_recall_keys_prefer_lookups_then_index_then_words(helper):
+    message = "arturgontijo: How big is the Brazilian capital?"
+    assert helper.recall_keys(message, '("brazil" "brasilia")', '("brasília")', 3) == (
+        '("brazil" "brasilia" "brasília")'
+    )
+    assert helper.recall_keys(message, '("arturgontijo" "brazil")', "()", 3) == '("brazil")'
+    # Without LOOKUP lines only capitalised words are worth a query.
+    assert helper.recall_keys(message, "()", "()", 3) == '("brazilian")'
+    assert helper.recall_keys("bob: How can we classify Divinópolis city?", "()", "()", 3) == '("divinópolis")'
+    assert helper.recall_keys("bob: Remind me what laptop I ordered. Ana knows.", "()", "()", 3) == '("ana")'
+    assert helper.recall_keys("no sender here", '("x" "y")', "()", 1) == '("x")'
+
+
+def test_parse_fact_drops_the_copula_of_a_longer_relation(helper):
+    assert helper.parse_fact("human | is similar to | monkey", "bob: hi") == '("human" "similar_to" "monkey")'
+    assert helper.parse_fact("human | similar to | chimp", "bob: hi") == '("human" "similar_to" "chimp")'
+    assert helper.parse_fact("banana | is a | fruit", "bob: hi") == '("banana" "is_a" "fruit")'
+    assert helper.parse_fact("bob | is | tall", "bob: hi") == '("bob" "is" "tall")'
+
+
+def test_describe_facts_lists_the_newest_fact_first(helper):
+    facts = ('(("human" similar_to "monkey" "bob" "2026-10-27 11:23:00") '
+             '("human" "similar_to" "chimp" "bob" "2026-10-27 11:33:00"))')
+    assert helper.describe_facts(facts, "ana: hi") == (
+        "human's similar to is chimp (said by bob on 2026-10-27 11:33:00); "
+        "human's similar to is monkey (said by bob on 2026-10-27 11:23:00)."
+    )
+
+
+def test_name_variants_add_the_message_spelling_and_title_case(helper):
+    assert helper.name_variants("team b", "ana: What do you know about Team B?") == '("team b" "Team B")'
+    assert helper.name_variants("ipad", "ana: Who owns the iPad?") == '("ipad" "iPad" "Ipad")'
+    assert helper.name_variants("divinópolis", "") == '("divinópolis" "Divinópolis")'
+    assert helper.join_values("2022", "17") == '"2022 17"'
+
+
+def test_parse_fact_rejects_note_like_relations(helper):
+    assert helper.parse_fact("I | note | Brasília was founded in 1960", "bob: hi") == "()"
+    # unlearn must still be able to remove such a fact stored by older code
+    assert helper.parse_fact_key("I | note", "bob: hi") == '("bob" "note")'
+    assert helper.parse_fact("Brasília | founded in | 1960", "bob: hi") == '("brasília" "founded_in" "1960")'
 
 
 def test_is_send_call_matches_only_a_top_level_send(helper):
@@ -274,7 +462,7 @@ def test_normalize_string_stringifies_non_text(helper):
 # --- extract_timestamp ----------------------------------------------------
 
 def test_extract_timestamp_parses_leading_history_stamp(helper):
-    assert helper.extract_timestamp('("2026-07-30 12:00:00" foo)') == datetime.datetime(
+    assert helper.extract_timestamp('("2026-07-30 12:00:00" "foo")') == datetime.datetime(
         2026, 7, 30, 12, 0, 0
     )
 
