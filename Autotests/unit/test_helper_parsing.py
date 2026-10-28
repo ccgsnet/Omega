@@ -334,6 +334,14 @@ def test_new_subjects_are_those_recalled_from_the_value_side(helper):
     assert helper.new_subjects(facts, '("brasília" "team b")', "bob", 1) == '("Team A" "team a")'
     assert helper.new_subjects(facts, '("Team A" "ipad" "club c" "team b")', "bob") == "()"
     assert helper.new_subjects("()", '("x")', "bob") == "()"
+    # Omega stored the fact as "team a"; other agents wrote "Team A". The
+    # lowercase key is not enough if that first round missed the capitals.
+    learned = '(("team a" "is_playing" "2026 championship" "bob" "2026-10-28 10:00:00" 1.0))'
+    about_a = "bob: What do you know about Team A?"
+    assert helper.new_subjects(learned, '("team a")', "bob", 3, about_a) == '("Team A")'
+    assert helper.new_subjects(
+        '(("team a" "is_playing" "2026 championship" "bob" "" 1.0) ("Team A" "jersey_color" "blue" "" "" 1.0))',
+        '("team a")', "bob", 3, about_a) == "()"
 
 
 def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(helper):
@@ -382,6 +390,19 @@ def test_denials_are_extracted_and_a_denied_fact_is_described_as_not_so(helper):
     assert helper.extracted_facts(reply) == '("Team A | is playing | 2026 championship")'
     assert helper.extracted_denials(reply) == '("Team B | is playing | 2026 championship" "none | x | y")'
     assert helper.extracted_denials("NONE") == "()"
+    # The model often writes FACT for a denial; the message is what makes it NOT.
+    denied = "arturgontijo: Team B is not playing the 2026 championship."
+    assert helper.extracted_facts("FACT Team B | plays | 2026 championship", denied) == "()"
+    assert helper.extracted_denials("FACT Team B | plays | 2026 championship", denied) == (
+        '("Team B | plays | 2026 championship")')
+    moved = "bob: I no longer live in Lisbon, I moved to Porto."
+    both = "FACT I | lives in | Lisbon\nFACT I | lives in | Porto"
+    assert helper.extracted_facts(both, moved) == '("I | lives in | Porto")'
+    assert helper.extracted_denials(both, moved) == '("I | lives in | Lisbon")'
+    playing = "arturgontijo: Team A is playing the 2026 championship."
+    assert helper.extracted_facts("FACT Team A | plays in | 2026 championship", playing) == (
+        '("Team A | plays in | 2026 championship")')
+    assert helper.extracted_denials("FACT Team A | plays in | 2026 championship", playing) == "()"
     assert "NOT subject | relation | value" in helper.FACT_EXTRACTION_PROMPT
     facts = ('(("team b" "is_playing" "2026 championship" "bob" "2026-10-27 23:00:00" 0.0) '
              '("bob" "likes" "tea" "bob" "2026-10-27 22:00:00" 0.0) '

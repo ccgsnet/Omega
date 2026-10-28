@@ -476,14 +476,52 @@ def _extraction_entries(reply, tag):
     return entries
 
 
-def extracted_facts(reply):
-    """'subject | relation | value' strings from FACT entries of an extraction reply."""
-    return _strings(*_extraction_entries(reply, "FACT"))
+_NEGATION = re.compile(r"(?i)(?:\bnot\b|\bnever\b|\bno\s+longer\b|\bno\s+more\b|n't\b)")
 
 
-def extracted_denials(reply):
-    """'subject | relation | value' strings from NOT entries: facts the speaker denies."""
-    return _strings(*_extraction_entries(reply, "NOT"))
+def _phrase_in_text(phrase, text):
+    """True when the words of phrase appear in order as whole words in text."""
+    words = [w for w in re.findall(r"\w+", str(phrase or "").lower()) if w]
+    if not words:
+        return False
+    return re.search(r"(?i)(?<!\w)" + r"\s+".join(re.escape(w) for w in words) + r"(?!\w)", text) is not None
+
+
+def _negated_clauses(message):
+    """Clauses of the latest message that contain a negation (not, n't, never, no longer)."""
+    text = _latest_text(message)
+    clauses = [c.strip() for c in re.split(r"\s*[,;.]+\s*|\s+(?:but|and|then)\s+", text, flags=re.I) if c.strip()]
+    return [c for c in clauses if _NEGATION.search(c)]
+
+
+def _message_denies_fact(entry, message):
+    """True when a negated clause of the message names this fact's subject and value.
+
+    Extraction often writes FACT for "Team B is not playing…"; the FACT line
+    is the positive form, and the message is what tells FACT from NOT.
+    """
+    parts = [p.strip() for p in _plain_text(entry).split("|")]
+    if len(parts) < 3:
+        return False
+    subject, value = parts[0], parts[-1]
+    return any(_phrase_in_text(subject, clause) and _phrase_in_text(value, clause)
+               for clause in _negated_clauses(message))
+
+
+def extracted_facts(reply, message=""):
+    """'subject | relation | value' strings from FACT entries, minus those the message denies."""
+    return _strings(*[entry for entry in _extraction_entries(reply, "FACT")
+                      if not _message_denies_fact(entry, message)])
+
+
+def extracted_denials(reply, message=""):
+    """'subject | relation | value' strings the speaker denies: NOT entries, and FACT entries the message negates."""
+    seen = []
+    for entry in _extraction_entries(reply, "NOT") + [e for e in _extraction_entries(reply, "FACT")
+                                                      if _message_denies_fact(e, message)]:
+        if entry not in seen:
+            seen.append(entry)
+    return _strings(*seen)
 
 
 # The provider answers this when a reasoning model spends the whole output budget thinking.
@@ -819,7 +857,7 @@ def fact_subjects(facts):
     return _strings(*subjects)
 
 
-def new_subjects(facts, keys, speaker="", limit=3):
+def new_subjects(facts, keys, speaker="", limit=3, message=""):
     """Subjects of recall tuples that were not looked up themselves, spelled as stored.
 
     A fact found from its value side, "Team A founded_in Brasília" for the key
@@ -829,18 +867,35 @@ def new_subjects(facts, keys, speaker="", limit=3):
     read in full. At most limit subjects, in the order found; a subject another
     agent stored with capitals ("Team A") is given lowercase as well, which is
     how the facts learned here about it are stored.
+
+    When Omega has stored a fact under the lowercase key ("team a") and the
+    recalled tuples do not yet include the other agents' spelling ("Team A"),
+    that spelling is added too. facts-about tries both, but a slow first round
+    can return only the learned fact; the second round then reads the rest.
     """
-    known = {str(k).lower() for k in re.findall(r'"([^"]*)"', str(keys or ""))}
+    key_list = re.findall(r'"([^"]*)"', str(keys or ""))
+    known_exact = set(key_list)
+    known = {str(k).lower() for k in key_list}
     known.add(str(speaker or "").lower())
+    have = {fact[0] for fact in _fact_tuples(facts)}
+    have_lower = {name.lower() for name in have}
     subjects = []
     for fact in _fact_tuples(facts):
         subject = fact[0]
         if subject and subject.lower() not in known and subject.lower() not in (s.lower() for s in subjects):
             subjects.append(subject)
+    for key in key_list:
+        if not _latest_text(message) or key.lower() not in have_lower:
+            continue
+        for variant in re.findall(r'"([^"]*)"', name_variants(key, message)):
+            if (variant not in have and variant not in known_exact
+                    and variant.lower() != str(speaker or "").lower()
+                    and variant.lower() not in (s.lower() for s in subjects)):
+                subjects.append(variant)
     names = []
     for subject in subjects[:int(limit)]:
         for name in (subject, subject.lower()):
-            if name not in names:
+            if name not in names and name not in known_exact:
                 names.append(name)
     return _strings(*names)
 

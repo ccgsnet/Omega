@@ -181,8 +181,8 @@
       ($_ (FACT_NOT_LEARNED "expected one short fact: subject | relation | value" $str)))))
 
 (= (learn-all $reply)
-   (union-atom (map-atom (sread (py-call (helper.extracted_facts $reply))) $fact (learn $fact))
-               (map-atom (sread (py-call (helper.extracted_denials $reply))) $fact (deny $fact))))
+   (union-atom (map-atom (sread (py-call (helper.extracted_facts $reply (current-message)))) $fact (learn $fact))
+               (map-atom (sread (py-call (helper.extracted_denials $reply (current-message)))) $fact (deny $fact))))
 
 (= (unlearn $str)
    (case (sread (py-call (helper.parse_fact_key $str (current-message))))
@@ -252,9 +252,10 @@
 ; about that subject ("which team from Brasília has a blue logo"), so the rest
 ; of its facts are read next, for up to maxFactConcepts such subjects, each as
 ; stored and lowercase (another agent's "Team A", Omega's "team a"). Subjects
-; that were keys, or the sender, are already read in full.
+; that were keys, or the sender, are already read in full, except the other
+; spelling of a key whose facts came back only under Omega's lowercase form.
 (= (expand-subjects $facts $keys $speaker)
-   (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts))))
+   (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts) (current-message))))
      (if (== $subjects ())
          ()
          (let $more (recall-failure
