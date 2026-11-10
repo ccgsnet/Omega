@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -204,6 +205,67 @@ def _unwrap_reply(text):
     return text.strip()
 
 
+def _unwrap_list(text):
+    """A reply written as a list literal (['a', 'b']): one item alone, several as bullet points."""
+    if not (text.startswith("[") and text.endswith("]")):
+        return text
+    try:
+        items = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return text
+    if not isinstance(items, (list, tuple)) or not items:
+        return text
+    items = [str(item).strip() for item in items if str(item).strip()]
+    return items[0] if len(items) == 1 else "\n".join(f"- {item}" for item in items)
+
+
+def _unwrap_parentheses(text):
+    """A reply wrapped whole in one pair of parentheses, as the model writes a send argument: '(What I know...)'."""
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        for i, char in enumerate(text):
+            depth += {"(": 1, ")": -1}.get(char, 0)
+            if depth == 0 and i < len(text) - 1:
+                return text
+        text = text[1:-1].strip()
+    return text
+
+
+def _drop_acknowledgement(text, message):
+    """'arturgontijo, noted: Miami is...' as 'Miami is...': the address and the bookkeeping word."""
+    speaker = message_speaker(message)
+    address = rf"(?:@?{re.escape(speaker)}\s*[,:]\s*)?" if speaker else ""
+    stripped = re.sub(rf"(?i)^{address}['\"`_]*noted\s*[:,.!\-\u2014]*\s*", "", text)
+    if speaker:
+        stripped = re.sub(rf"(?i)^@?{re.escape(speaker)}\s*,\s*", "", stripped)
+    if stripped and stripped != text:
+        stripped = stripped[0].upper() + stripped[1:]
+    return stripped or text
+
+
+TRAILING_QUOTES = {"`": "`", '"': '"', "'": "'", "_": "_", "\u2019": "\u2018", "\u201d": "\u201c"}
+
+
+def _drop_unpaired_trailing_quotes(text):
+    """Quote marks left at the end without a partner: 'Orlando.\\'' loses it, 'is "Magic City."' keeps it."""
+    text = text.strip()
+    while text and text[-1] in TRAILING_QUOTES:
+        closing = text[-1]
+        opening = TRAILING_QUOTES[closing]
+        body = text[:-1]
+        if closing == "'":
+            # An apostrophe inside a word (Miami's) opens nothing; one before a word does.
+            paired = re.search(r"(?<!\w)'(?=\w)", body) is not None
+        elif opening != closing:
+            paired = body.count(opening) > body.count(closing)
+        else:
+            paired = body.count(closing) % 2 == 1
+        if paired:
+            break
+        text = body.rstrip()
+    return text
+
+
 def _drop_duplicated_wrap(text):
     """A quoted copy of the answer sitting in front of the same answer."""
     match = re.match(r"^[`\"'_]+(.+?)[`\"'_]+\s+(.*)$", text, re.DOTALL)
@@ -232,8 +294,9 @@ def clean_reply(reply, message=""):
     commands = "|".join(re.escape(cmd) for cmd in sorted(LLM_COMMANDS | {"learn"}))
     text = re.sub(rf"(?:\s*\((?:{commands})\b[^()]*\))+\s*$", "", text)
     text = _drop_duplicated_wrap(text.strip())
-    text = _unwrap_reply(text)
-    text = re.sub(r"[`\"'_]+$", "", text).strip()
+    text = _unwrap_reply(_unwrap_list(_unwrap_parentheses(_unwrap_reply(text))))
+    text = _unwrap_reply(_drop_acknowledgement(text, message))
+    text = _drop_unpaired_trailing_quotes(text)
     lines = text.split("\n")
     if len(lines) > 1 and _echoes(lines[0], _latest_text(message)):
         lines = lines[1:]
@@ -299,10 +362,45 @@ RELATION_PLACEHOLDERS = {"note", "notes", "noted", "fact", "facts", "info", "inf
 # Longest subject, relation and value accepted, in words. A longer field means
 # a sentence was passed instead of one fact about one named thing.
 FACT_MAX_WORDS = (4, 3, 6)
+# Kinds of place a thing belongs to. "Orlando | city of | Florida state" is
+# stored as "orlando | state | florida", the relation a same_state_as fact names.
+PLACE_KINDS = {"state", "country", "province", "region", "county", "district", "continent", "island"}
+# "same state as", "is in the same state as", "shares state with": one thing has the
+# other's value of an attribute. Every spelling is stored as same_<attribute>_as.
+SHARED_RELATION = re.compile(r"^(?:(?:is|are|lives|located|based|sits)_)?(?:(?:in|from|of|on)_)?(?:the_)?"
+                             r"(?:same_(\w+?)_(?:as|with|of)|shares?_(?:the_)?(\w+?)_with)$")
+
+
+def shared_attribute(relation):
+    """The attribute a same_<attribute>_as relation shares ("state"), or "" for any other relation."""
+    match = SHARED_RELATION.match(fact_token(relation))
+    return (match.group(1) or match.group(2)) if match else ""
 
 
 def _fact_words(field):
     return [token for token in (fact_token(word) for word in field.split()) if token]
+
+
+def _place_relation(relation, value, message):
+    """A membership fact ("city of", "in") about a kind of place as (kind, place), else None.
+
+    The kind is read from the value ("Florida state", "state of Florida") or,
+    when the model dropped it, from the message ("the Florida state").
+    """
+    if not relation or relation[-1] not in ("of", "in", "within"):
+        return None
+    while len(value) > 1 and value[0] in FACT_ARTICLES:
+        value = value[1:]
+    if len(value) > 1 and value[-1] in PLACE_KINDS:
+        return [value[-1]], value[:-1]
+    if len(value) > 2 and value[0] in PLACE_KINDS and value[1] == "of":
+        return [value[0]], value[2:]
+    text = _latest_text(message).lower()
+    place = r"\s+".join(re.escape(w) for w in value)
+    for kind in PLACE_KINDS:
+        if re.search(rf"(?<!\w){place}\s+{kind}(?!\w)|(?<!\w){kind}\s+of\s+(?:the\s+)?{place}(?!\w)", text):
+            return [kind], value
+    return None
 
 
 def _fact_fields(text, count, message):
@@ -310,6 +408,14 @@ def _fact_fields(text, count, message):
     fields = [_fact_words(field) for field in _plain_text(text).split("|")]
     if len(fields) != count or not all(fields):
         return None
+    if count >= 2:
+        shared = shared_attribute("_".join(fields[1]))
+        if shared:
+            fields[1] = ["same", shared, "as"]
+        elif count == 3:
+            place = _place_relation(fields[1], fields[2], message)
+            if place:
+                fields[1], fields[2] = place
     if any(len(words) > limit for words, limit in zip(fields, FACT_MAX_WORDS)):
         return None
     if any(len(words) == 1 and words[0] in FACT_PLACEHOLDERS for words in fields):
@@ -456,6 +562,11 @@ FACT_EXTRACTION_PROMPT = (
     "I moved to Lisbon last year. -> FACT I | lives in | Lisbon\n"
     "People from Oslo are tall and the Acme team is remote. -> FACT Oslo | people | tall\nFACT Acme team | work mode | remote\n"
     "Bananas are a fruit and dolphins are mammals. -> FACT banana | is a | fruit\nFACT dolphin | is a | mammal\n"
+    "Santos is a city of the São Paulo state. -> FACT Santos | state | São Paulo\n"
+    "Porto is a city in Portugal and about 230 thousand people live there. -> FACT Porto | country | Portugal\nFACT Porto | population | about 230 thousand\n"
+    "Lyon is called the City of Lights. -> FACT Lyon | nickname | City of Lights\n"
+    "Niterói is in the same state as Rio. -> FACT Niterói | same state as | Rio\n"
+    "Ana works in the same team as Bruno. -> FACT Ana | same team as | Bruno\n"
     "Ana does not work at Acme. -> NOT Ana | works at | Acme\n"
     "I no longer live in Lisbon, I moved to Porto. -> NOT I | lives in | Lisbon\nFACT I | lives in | Porto\n"
     "What is my favorite color? -> LOOKUP I\n"
@@ -476,6 +587,8 @@ FACT_EXTRACTION_PROMPT = (
     "Every question that names a person or thing gets a LOOKUP line, whatever the topic. "
     "A question that joins conditions with and gets an ALL line, with or an ANY line, besides any LOOKUP. "
     "A NOT line names the fact being denied in its positive form, never a relation containing not. "
+    "A thing said to share something with another named thing gets one line with the relation same <thing> as, "
+    "never the attribute's value guessed. "
     "Requests, commands and rules with a condition give nothing. If there is no FACT, NOT, LOOKUP, ALL or ANY, write NONE.\n"
     "MESSAGE: "
 )
@@ -817,6 +930,10 @@ def _negated(verb):
 
 
 def _fact_sentence(subject, relation, value, speaker, denied=False):
+    shared = shared_attribute(relation)
+    if shared:
+        verb = "are" if subject == speaker else "is"
+        return f"{'you' if subject == speaker else subject} {verb}{' not' if denied else ''} in the same {shared} as {value}"
     relation, value = relation.replace("_", " "), value.replace("_", " ")
     words = relation.split()
     # "population is" reads as "population is is" once the sentence adds its own verb.
@@ -835,6 +952,8 @@ def _fact_sentence(subject, relation, value, speaker, denied=False):
 def _fact_source(who, when, speaker):
     if not who:
         return ""
+    if who.startswith(INFERRED_SOURCE):
+        return f" ({who})"
     teller = "you" if who == speaker else who
     return f" (said by {teller} on {when})" if when else f" (said by {teller})"
 
@@ -891,6 +1010,47 @@ def merge_facts(facts):
     return _fact_list_text(kept)
 
 
+INFERRED_SOURCE = "inferred: "
+
+
+def _shares(fact, attribute):
+    """True when a fact gives the attribute itself: "state" or "home_state" for "state", or a value "florida state"."""
+    relation, value = fact[1], fact[2].lower().split()
+    return not shared_attribute(relation) and (attribute in relation.split("_") or value[-1:] == [attribute])
+
+
+def infer_shared_facts(facts):
+    """Recalled tuples plus the attribute values that same_<attribute>_as facts carry across.
+
+    "miami same_state_as orlando" and "orlando state florida" give "miami state
+    florida", whichever agent stored each premise; the relation is symmetric,
+    so orlando also takes a state stored only for miami. A subject that already
+    has a value for the attribute keeps it, and a denied premise gives nothing.
+    The inferred tuple's source names both premises, and its time is the newer one.
+    """
+    tuples = _fact_tuples(facts)
+    true = [fact for fact in tuples if not _denied(fact)]
+    inferred = []
+    for link in true:
+        attribute = shared_attribute(link[1])
+        if not attribute:
+            continue
+        for this, other in ((link[0], link[2]), (link[2], link[0])):
+            if any(fact[0].lower() == this.lower() and _shares(fact, attribute) for fact in true + inferred):
+                continue
+            for fact in true:
+                if fact[0].lower() != other.lower() or not _shares(fact, attribute):
+                    continue
+                value = fact[2]
+                if value.lower().split()[-1:] == [attribute] and len(value.split()) > 1:
+                    value = value.rsplit(" ", 1)[0]
+                because = (f"{INFERRED_SOURCE}{_fact_sentence(*link[:3], '')} and "
+                           f"{_fact_sentence(*fact[:3], '')}")
+                inferred.append((this, attribute, value, because, max(link[4], fact[4]), min(link[5], fact[5])))
+                break
+    return _fact_list_text(tuples + inferred)
+
+
 def fact_subjects(facts):
     """The distinct subjects of recall tuples, as ("Team A" "team b")."""
     subjects = []
@@ -911,6 +1071,10 @@ def new_subjects(facts, keys, speaker="", limit=3, message=""):
     agent stored with capitals ("Team A") is given lowercase as well, which is
     how the facts learned here about it are stored.
 
+    The other side of a same_<attribute>_as fact comes first, whichever side
+    was recalled: "miami same_state_as orlando" for the key "miami" reads
+    orlando's facts, where the state shared with miami is stored.
+
     When Omega has stored a fact under the lowercase key ("team a") and the
     recalled tuples do not yet include the other agents' spelling ("Team A"),
     that spelling is added too. facts-about tries both, but a slow first round
@@ -923,10 +1087,17 @@ def new_subjects(facts, keys, speaker="", limit=3, message=""):
     have = {fact[0] for fact in _fact_tuples(facts)}
     have_lower = {name.lower() for name in have}
     subjects = []
+
+    def add(name):
+        if name and name.lower() not in known and name.lower() not in (s.lower() for s in subjects):
+            subjects.append(name)
+
     for fact in _fact_tuples(facts):
-        subject = fact[0]
-        if subject and subject.lower() not in known and subject.lower() not in (s.lower() for s in subjects):
-            subjects.append(subject)
+        if shared_attribute(fact[1]) and not _denied(fact):
+            add(fact[2])
+            add(fact[0])
+    for fact in _fact_tuples(facts):
+        add(fact[0])
     for key in key_list:
         if not _latest_text(message) or key.lower() not in have_lower:
             continue

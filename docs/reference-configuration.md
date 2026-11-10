@@ -22,6 +22,7 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | `maxOutputToken` | 6000 | Output cap passed to the provider. |
 | `reasoningMode` | `medium` | Reasoning-effort hint passed to the provider (`reasoning_effort` on OpenAI-compatible endpoints). |
 | `wakeupInterval` | 600 (seconds) | How long idle before the next scheduled wake-up. |
+| `idleThinking` | `True` | Call the model on turns with no new or unanswered user message. `False` calls it only for a new message and the reply turns after it, which also disables scheduled wake-up work; `config/config.yaml` sets `False`. |
 
 ## Memory (`src/memory.metta`, `initMemory`)
 

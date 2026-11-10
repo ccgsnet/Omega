@@ -10,6 +10,7 @@
 (= (autoLearnFacts) (empty))
 (= (factExtractionTokens) (empty))
 (= (factExtractionReasoning) (empty))
+(= (idleThinking) (empty))
 
 (= (initLoop)
    (progn (configure maxNewInputLoops 50) ;20
@@ -23,6 +24,7 @@
           (configure autoLearnFacts True)
           (configure factExtractionTokens 4000)
           (configure factExtractionReasoning (reasoningMode))
+          (configure idleThinking True)
           (configure memoryDirectory
                (joinPath ((py-call (helper.projectRootDirectory)) memory)))
           (change-state! &prevmsg "")
@@ -32,11 +34,17 @@
           (change-state! &pendingResults "")
           (change-state! &knownFacts "none")
           (change-state! &lastFactKeys ())
+          (change-state! &nextWakeAt (+ (get_time) (wakeupInterval)))
           ))
 
 ; Turns a user message stays unanswered-visible while the agent gathers
 ; results with other skills before replying.
 (= (maxReplyTurns) 5)
+
+; With idleThinking False the model is called only for a new message and the
+; reply turns after it. Idle turns otherwise cost a full prompt each, which a
+; local server answers one at a time ahead of the next message, and small
+; models fill them with "no new message" lines that pile up in HISTORY.
 
 ; Facts a user states and the names a user asks about are extracted by one
 ; separate model call before the agent sees the message, so storing and recall
@@ -92,7 +100,10 @@
 ; of the stored value ("blue") is rewritten from the message before the query.
 ; The ALL values are looked up as names as well, so a conjunction that still
 ; misses finds the facts of each value; and the subjects those facts name,
-; which the message did not, are read in full (expand-subjects).
+; which the message did not, are read in full (expand-subjects). A
+; same_<attribute>_as fact carries the other side's value of the attribute
+; over, so "miami same_state_as orlando" with "orlando state florida" also
+; reads "miami's state is florida", even when each was stored by another agent.
 (= (remember-message $msg)
    (let* (($reply (extract-from-message $msg))
           ($_ (learn-from-reply $reply))
@@ -104,7 +115,8 @@
           ($joint (conjunction-facts (sread (py-call (helper.extracted_conjunction $reply $msg)))))
           ($found (unique-atom (union-atom $facts $joint)))
           ($more (expand-subjects $found $keys $speaker))
-          ($known (sread (py-call (helper.merge_facts (repr (union-atom $found $more)))))))
+          ($merged (py-call (helper.merge_facts (repr (union-atom $found $more)))))
+          ($known (sread (py-call (helper.infer_shared_facts $merged)))))
      (change-state! &knownFacts (describe-facts $known $msg))))
 
 ; Small models often send idle chatter such as "No new user input." despite the
@@ -125,11 +137,11 @@
                          (newline) (getPromptExtensions) (newline)
                          " OUTPUT_FORMAT: Up to 5 lines. One skill per line. No quotes around args. No prose." (newline)
                          " A user reply is the send skill followed by the reply." (newline)
+                         " Write a reply as a person chatting: plain sentences, or a few short points on separate lines starting with -; never a list in brackets, never the user's name or the word noted in front." (newline)
                          " Do not call send when there is no new or unanswered user message." (newline)
                          " Skill results arrive in the next turn: do not send an answer that depends on a skill called in the same turn." (newline)
                          " For UNANSWERED-HUMAN-MSG, send the answer built from its RESULTS_GATHERED_FOR_IT. Do not repeat a skill call already shown there." (newline)
                          " KNOWN_FACTS are learned facts related to the user message, written to the user: your means the user's, never yours." (newline)
-                         " Facts the user states are learned automatically: acknowledge them with send." (newline)
                          " Answer questions from KNOWN_FACTS in the same person, for example: Your favorite color is blue. Never invent a fact that is not there." (newline)
                          " Use unlearn only to remove a fact that is no longer true." (newline)
                          " SAVE_PERMANENT_FILES_DIR: " (memoryDirectory)
@@ -182,7 +194,8 @@
                              ($msg (get-state &prevmsg))
                              ($_ (if (and (> $k 1) $msgnew)
                                      (change-state! &loops (maxNewInputLoops)) _)))
-                            (if (> (get-state &loops) 0)
+                            (if (and (> (get-state &loops) 0)
+                                     (or (idleThinking) (or $msgnew (> (get-state &replyTurns) 0))))
                                 (let* (($gathered (get-state &pendingResults))
                                        ($_ (if $msgnew (remember-message $msg) _))
                                        ($facts (get-state &knownFacts))

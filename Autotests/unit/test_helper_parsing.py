@@ -253,17 +253,45 @@ def test_clean_reply_removes_format_noise_seen_in_chat(helper):
         "Divinópolis' people are poor\nSaid by you."
     )
     assert helper.clean_reply("_quote__apostrophe_Noted: Team B is not playing the 2026 championship._apostrophe__quote_") == (
-        "Noted: Team B is not playing the 2026 championship."
+        "Team B is not playing the 2026 championship."
     )
     assert helper.clean_reply("'_Noted. Here's what I know about Team A:_") == (
-        "Noted. Here's what I know about Team A:"
+        "Here's what I know about Team A:"
     )
     assert helper.clean_reply(
         "`'_Team B has a red logo and is from Divinópolis.'` Team B has a red logo and is from Divinópolis."
     ) == "Team B has a red logo and is from Divinópolis."
     assert helper.clean_reply("'_Noted: Team B. Team B is not in the 2026 championship.") == (
-        "Noted: Team B. Team B is not in the 2026 championship."
+        "Team B. Team B is not in the 2026 championship."
     )
+
+
+def test_clean_reply_drops_list_wrappers_and_acknowledgements(helper):
+    message = "arturgontijo: What do you know about Miami?"
+    assert helper.clean_reply(
+        "['Miami is in the state of Florida (same state as Orlando). Its nickname is \"Magic City.\"']", message
+    ) == 'Miami is in the state of Florida (same state as Orlando). Its nickname is "Magic City."'
+    assert helper.clean_reply("['Miami is in Florida.', 'About 500 thousand people live there.']", message) == (
+        "- Miami is in Florida.\n- About 500 thousand people live there."
+    )
+    statement = "arturgontijo: Miami is called the Magic City."
+    assert helper.clean_reply("arturgontijo, noted: Miami is the Magic City.", statement) == "Miami is the Magic City."
+    assert helper.clean_reply("noted: Miami is in the same state as Orlando.'", statement) == (
+        "Miami is in the same state as Orlando."
+    )
+    assert helper.clean_reply("arturgontijo, Miami's nickname is the Magic City.", statement) == (
+        "Miami's nickname is the Magic City."
+    )
+    assert helper.clean_reply("I noted that Miami's nickname is 'Magic City'", statement) == (
+        "I noted that Miami's nickname is 'Magic City'"
+    )
+    assert helper.clean_reply("[1, 2] are the options") == "[1, 2] are the options"
+    about_ny = "arturgontijo: What do you know about New York?"
+    assert helper.clean_reply(
+        "(What I know about New York:\n- New York is in the United States.\n- Its nickname is the Big Apple.)", about_ny
+    ) == "What I know about New York:\n- New York is in the United States.\n- Its nickname is the Big Apple."
+    assert helper.clean_reply("(a) Miami (b) Orlando)") == "(a) Miami (b) Orlando)"
+    assert helper.clean_reply("(It is in Florida (same state as Orlando))") == "It is in Florida (same state as Orlando)"
 
 
 def test_clean_reply_keeps_ordinary_replies(helper):
@@ -363,6 +391,48 @@ def test_new_subjects_are_those_recalled_from_the_value_side(helper):
     assert helper.new_subjects(
         '(("team a" "is_playing" "2026 championship" "bob" "" 1.0) ("Team A" "jersey_color" "blue" "" "" 1.0))',
         '("team a")', "bob", 3, about_a) == "()"
+
+
+def test_shared_relations_are_stored_as_same_attribute_as(helper):
+    for relation in ("same state as", "is in the same state as", "shares state with", "in same state with"):
+        assert helper.parse_fact(f"Miami | {relation} | Orlando") == '("miami" "same_state_as" "orlando")'
+    assert helper.parse_fact_key("Ana | same team with") == '("ana" "same_team_as")'
+    assert helper.shared_attribute("lives_in") == ""
+
+
+def test_a_city_of_a_kind_of_place_is_stored_under_that_kind(helper):
+    message = "arturgontijo: Orlando is a city of the Florida state."
+    assert helper.parse_fact("Orlando | is a city of | Florida state", message) == '("orlando" "state" "florida")'
+    assert helper.parse_fact("Orlando | is a city of | Florida", message) == '("orlando" "state" "florida")'
+    assert helper.parse_fact("Orlando | city of | the state of Florida") == '("orlando" "state" "florida")'
+    # Without a kind of place in the value or the message the relation stays as said.
+    assert helper.parse_fact("Miami | city of | Florida", "bob: Miami is a city of Florida.") == (
+        '("miami" "city_of" "florida")')
+
+
+def test_same_attribute_facts_read_the_other_side_and_carry_its_value(helper):
+    # Omega B learned miami same_state_as orlando; Omega A learned orlando state florida.
+    about_miami = (
+        '(("miami" "same_state_as" "orlando" "bob" "2026-11-10 10:05:00" 1.0)'
+        ' ("miami" "nickname" "magic city" "bob" "2026-11-10 10:06:00" 1.0))')
+    assert helper.new_subjects(about_miami, '("miami")', "carol", 3) == '("orlando")'
+    with_orlando = about_miami[:-1] + (
+        ' ("orlando" "state" "florida" "ana" "2026-11-10 10:00:00" 1.0)'
+        ' ("orlando" "nickname" "city beautiful" "ana" "2026-11-10 10:01:00" 1.0))')
+    known = helper.infer_shared_facts(with_orlando)
+    assert ('("miami" "state" "florida" "inferred: miami is in the same state as orlando and '
+            'orlando\'s state is florida" "2026-11-10 10:05:00" 1.0)') in known
+    text = helper.describe_facts(known, "carol: What do you know about Miami?")
+    assert "miami's state is florida (inferred: miami is in the same state as orlando and orlando's state is florida)" in text
+    assert "miami is in the same state as orlando (said by bob" in text
+    # The relation is symmetric, a stated value is kept, and a denied link carries nothing.
+    assert '"orlando" "state" "florida" "inferred' in helper.infer_shared_facts(
+        '(("miami" "same_state_as" "orlando" "" "" 1.0) ("miami" "state" "florida" "" "" 1.0))')
+    assert "inferred" not in helper.infer_shared_facts(
+        '(("miami" "same_state_as" "orlando" "" "" 1.0) ("miami" "state" "texas" "" "" 1.0)'
+        ' ("orlando" "state" "florida" "" "" 1.0))')
+    assert "inferred" not in helper.infer_shared_facts(
+        '(("miami" "same_state_as" "orlando" "bob" "" 0.0) ("orlando" "state" "florida" "" "" 1.0))')
 
 
 def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(helper):
