@@ -100,21 +100,16 @@
           ($ok (progn (log INFO "das-memory" "DAS space answers queries") True))))
        (progn (log WARNING "das-memory" (DAS_HTTP_DOWN (dasEndpoint) "GET /ping did not answer PONG")) False)))
 
-; Plain-language facts from conversation are beliefs over the binary PLN form
+; Plain-language facts from conversation are stored in the binary PLN form
 ; (Evaluation (Predicate "relation") (List (Concept "subject") (Concept "value"))),
-; the shape the lib_pln rules match, so a learned fact is a premise for |~ and
-; (beliefs "(Evaluation (Predicate \"capital\") (List (Concept \"brazil\") $1))")
-; finds it. The nested Evaluation is itself a link in DAS, so other agents on
-; the same router find the fact with a bare Evaluation pattern; the string
-; predicate name and lowercase concept names are the convention shared with them. A relation may hold several values ("human similar_to monkey" and
-; "human similar_to chimp" are both true), so a new value is added beside the
-; old ones and nothing is forgotten without unlearn; recall lists the newest
-; first. Each fact carries (Stated term "nick" "time") provenance.
-; A fact the user denies ("Team B is not playing the 2026 championship") is
-; the same term believed at (stv 0.0 0.9), so |~ and beliefs see a false
-; premise rather than a relation called not_playing, and recall reads it as
-; "team b is not playing 2026 championship". Stating the fact again with the
-; other truth replaces that one value and leaves the relation's other values.
+; the shape the lib_pln rules match. Other agents on the same router find the
+; fact with the same bare Evaluation pattern; the string predicate name and
+; lowercase concept names are the convention shared with them. A relation may
+; hold several values ("human similar_to monkey" and "human similar_to chimp"
+; are both true), so a new value is added beside the old ones and nothing is
+; forgotten without unlearn. Facts are stored as the bare term alone (see
+; relation-values below); the earlier Belief/Stated/Fact form, which gave each
+; fact a truth and a source, is kept commented as FACT-RECORDS.
 
 (= (current-message)
    (case (catch (get-state &prevmsg))
@@ -129,55 +124,77 @@
 ; Predicate is also a PeTTa builtin that builds Prolog terms, so the fact term
 ; is parsed from text and only ever bound by let or placed in add-atom,
 ; remove-atom and match patterns. learn reports (LEARNED subject relation value)
-; for a new fact and (KNOWN subject relation value) for one already stored.
+; and deny (DENIED subject relation value).
 
 (= (fact-term $s $r $v)
    (sread (py-call (helper.fact_term $s $r $v))))
 
-; The DAS pattern index keys a link by its top-level targets only, so a pattern
-; whose names sit inside the nested Evaluation, as every Belief, Stated and bare
-; Evaluation query here does, reads every link of that type and matches each in
-; the query engine. A learned fact is therefore also written as one record per
-; name it holds, (Fact (Concept "name") <term> <truth> (Stated "who" "when")),
-; with the name a top-level target: one indexed query returns a name's facts,
-; both sides, with truth and source. Belief and Stated stay the facts' form for
-; |~, beliefs and other agents; the records are kept in step with them.
+; A learned fact is stored as its bare term alone,
+; (Evaluation (Predicate "relation") (List (Concept "subject") (Concept "value"))),
+; the form other agents on the router write, so every agent reads every fact
+; the same way. There is no truth or source: a denied fact is removed rather
+; than believed false, and recall cannot say who stated a fact or when.
+; The DAS pattern index keys a link by its top-level targets only, so a query
+; naming a concept inside the List reads every Evaluation and matches each in
+; the query engine.
+;
+;; FACT-RECORDS (rollback): the earlier form kept each fact as
+;; (Belief term (stv f c)), (Stated term "who" "when") and one
+;; (Fact (Concept "name") term (stv f c) (Stated "who" "when")) record per
+;; name, the name a top-level target, so one indexed query returned a name's
+;; facts with truth and source. To restore it, uncomment every ";; FACT-RECORDS"
+;; definition in this file and remove the bare-Evaluation one that follows it.
+;;
+;; (= (relation-values $s $r)
+;;    (collapse (match &das (Fact (Concept $s) (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $tv $src) $found)))
+;;
+;; (= (relation-truths $s $r)
+;;    (collapse (match &das (Fact (Concept $s) (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) (stv $f $c) $src) ($found $f))))
+;;
+;; (= (forget-value $s $r $v)
+;;    (let $term (fact-term $s $r $v)
+;;      (progn (map-atom (collapse (match &das (Belief $term $tv) $tv)) $tv (remove-atom &das (Belief $term $tv)))
+;;             (map-atom (collapse (match &das (Stated $term $who $when) ($who $when))) $p
+;;                       (let ($who $when) $p (remove-atom &das (Stated $term $who $when))))
+;;             (map-atom (collapse (match &das (Fact $key $term $tv $src) ($key $tv $src))) $p
+;;                       (let ($key $tv $src) $p (remove-atom &das (Fact $key $term $tv $src))))
+;;             (catch (remove-atom &das $term)))))
+;;
+;; (= (store-fact-as $s $r $v $tv $report)
+;;    (let* (((stv $strength $confidence) $tv)
+;;           ($truths (relation-truths $s $r)))
+;;      (if (is-member ($v $strength) $truths)
+;;          (KNOWN $s $r $v)
+;;          (let* (($_ (if (is-member $v (relation-values $s $r)) (forget-value $s $r $v) ()))
+;;                 ($term (fact-term $s $r $v))
+;;                 ($who (sread (py-call (helper.speaker_literal (current-message)))))
+;;                 ($when (get_time_as_string))
+;;                 ($_ (add-atom &das (Belief $term $tv)))
+;;                 ($_ (add-atom &das (Stated $term $who $when)))
+;;                 ($_ (add-atom &das (Fact (Concept $s) $term $tv (Stated $who $when))))
+;;                 ($_ (if (== $s $v) () (add-atom &das (Fact (Concept $v) $term $tv (Stated $who $when))))))
+;;            ($report $s $r $v)))))
+
 (= (relation-values $s $r)
-   (collapse (match &das (Fact (Concept $s) (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $tv $src) $found)))
+   (collapse (match &das (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $found)))
 
-; The values of a relation with the strength each is believed at: (("tea" 1.0) ("coffee" 0.0)).
+; Every stored value is true: (("tea" 1.0) ("coffee" 1.0)).
 (= (relation-truths $s $r)
-   (collapse (match &das (Fact (Concept $s) (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) (stv $f $c) $src) ($found $f))))
+   (map-atom (relation-values $s $r) $found ($found 1.0)))
 
-; In DAS the Evaluation nested in a removed Belief stays as a link of its own
-; and would be read back as a fact from another agent, so it is removed too;
-; in a local space it is not a separate atom and the removal is a no-op.
 (= (forget-value $s $r $v)
    (let $term (fact-term $s $r $v)
-     (progn (map-atom (collapse (match &das (Belief $term $tv) $tv)) $tv (remove-atom &das (Belief $term $tv)))
-            (map-atom (collapse (match &das (Stated $term $who $when) ($who $when))) $p
-                      (let ($who $when) $p (remove-atom &das (Stated $term $who $when))))
-            (map-atom (collapse (match &das (Fact $key $term $tv $src) ($key $tv $src))) $p
-                      (let ($key $tv $src) $p (remove-atom &das (Fact $key $term $tv $src))))
-            (catch (remove-atom &das $term)))))
+     (catch (remove-atom &das $term))))
 
-; A value already believed at the same strength is KNOWN; one believed at the
-; other strength is replaced, so "is not playing" after "is playing" leaves
-; one fact, the newer, and the relation's other values stay.
+; A stated fact is added and a denied one removed, with no query first: the
+; handle is the hash of the term, so adding a stored fact again changes
+; nothing, and removing one that is not stored is caught.
 (= (store-fact-as $s $r $v $tv $report)
    (let* (((stv $strength $confidence) $tv)
-          ($truths (relation-truths $s $r)))
-     (if (is-member ($v $strength) $truths)
-         (KNOWN $s $r $v)
-         (let* (($_ (if (is-member $v (relation-values $s $r)) (forget-value $s $r $v) ()))
-                ($term (fact-term $s $r $v))
-                ($who (sread (py-call (helper.speaker_literal (current-message)))))
-                ($when (get_time_as_string))
-                ($_ (add-atom &das (Belief $term $tv)))
-                ($_ (add-atom &das (Stated $term $who $when)))
-                ($_ (add-atom &das (Fact (Concept $s) $term $tv (Stated $who $when))))
-                ($_ (if (== $s $v) () (add-atom &das (Fact (Concept $v) $term $tv (Stated $who $when))))))
-           ($report $s $r $v)))))
+          ($term (fact-term $s $r $v)))
+     (if (> $strength 0.5)
+         (progn (add-atom &das $term) ($report $s $r $v))
+         (progn (catch (remove-atom &das $term)) ($report $s $r $v)))))
 
 (= (store-fact $s $r $v) (store-fact-as $s $r $v (factTruth) LEARNED))
 
@@ -206,19 +223,15 @@
 (= (describe-facts $facts $msg)
    (py-call (helper.describe_facts (repr $facts) $msg)))
 
-; Concept names looked up per message besides the sender. Each name is one
-; indexed query, plus scans when external facts are read, so this bounds the
-; delay per message.
+; Concept names looked up per message besides the sender. Each name is two
+; queries, plus more when external facts are read, so this bounds the delay
+; per message.
 (= (maxFactConcepts) 3)
 
 ; Facts about $key and facts whose value is $key, as
-; ("subject" "relation" "value" "who" "when" strength).
-; Learned facts are read from the Fact records of $key, so each comes with its
-; truth (1.0 stated, 0.0 denied) and its source, which answers "who told you
-; that?" and "when?" with no further query. With dasExternalFacts the bare
-; Evaluation form is read as well: that is what other agents on the same
-; router write, with no source and taken as true, and also where beliefs
-; derived by |- or |~ end up. Other agents keep the spelling of the user, so
+; ("subject" "relation" "value" "who" "when" strength), who and when empty
+; and the strength 1.0 for a bare Evaluation. With dasExternalFacts the other
+; spellings other agents use are read as well. Other agents keep the spelling of the user, so
 ; the key is tried as written in the message and in Title Case besides
 ; lowercase. A three-place record (subject, value, value) is read as one value.
 ; Both forms run every time, because a name may have facts from both sides
@@ -226,20 +239,27 @@
 ; nested Evaluation also answers the bare query, and merge_facts drops that
 ; copy in favour of the one with its source and truth.
 
-; The learned facts naming $key, either side, from its Fact records: one indexed query.
+;; FACT-RECORDS (rollback):
+;; (= (stated-facts-about $key)
+;;    (collapse (match &das (Fact (Concept $key) (Evaluation (Predicate $r) (List (Concept $s) (Concept $v))) (stv $f $c) (Stated $who $when))
+;;                     ($s $r $v $who $when $f))))
+;;
+;; (= (stated-facts-of $name)
+;;    (collapse (match &das (Fact (Concept $name) (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) (stv $f $c) (Stated $who $when))
+;;                     ($name $r $v $who $when $f))))
+
+; The learned facts naming $key, as subject and as value: two queries.
 (= (stated-facts-about $key)
-   (collapse (match &das (Fact (Concept $key) (Evaluation (Predicate $r) (List (Concept $s) (Concept $v))) (stv $f $c) (Stated $who $when))
-                    ($s $r $v $who $when $f))))
+   (collapse (superpose ((match &das (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) ($key $r $v "" "" 1.0))
+                         (match &das (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) ($s $r $key "" "" 1.0))))))
 
-; The learned facts with $name as subject. The subject is bound in the nested
-; term as well, which the query engine checks on the records the index returned.
+; The learned facts with $name as subject: one query.
 (= (stated-facts-of $name)
-   (collapse (match &das (Fact (Concept $name) (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) (stv $f $c) (Stated $who $when))
-                    ($name $r $v $who $when $f))))
+   (collapse (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" "" 1.0))))
 
-; Bare Evaluations are what other agents on the router write, with no Fact
-; record. Reading them scans every Evaluation in every AtomDB, several times
-; per name, so dasExternalFacts False skips it when only Omega agents write.
+; Other agents keep the user's spelling ("Team A"); trying it besides the
+; lowercase one Omega writes costs up to nine more queries per name, so
+; dasExternalFacts False skips it when only Omega agents write.
 (= (readExternalFacts)
    (py-call (helper.is_enabled (configGetByKey dasExternalFacts True))))
 
@@ -266,8 +286,8 @@
                          (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v) (Concept $w)))
                                 (let $joined (sread (py-call (helper.join_values $v $w))) ($name $r $joined "" "" 1.0)))))))
 
-; The facts of one subject spelled as stored, as subject only: one indexed
-; query, and two scans when external facts are read.
+; The facts of one subject spelled as stored, as subject only: one query, and
+; two more when external facts are read.
 (= (subject-facts $name)
    (let $stated (stated-facts-of $name)
      (if (readExternalFacts)
@@ -343,12 +363,16 @@
    (collapse (let $subject (superpose $subjects)
                (match &das (Belief (Evaluation (Predicate $r) (List (Concept $subject) (Concept $v))) (stv $f $c)) ($subject $r $v $f)))))
 
-(= (without-denied $facts)
-   (if (== $facts ())
-       ()
-       (let $subjects (sread (py-call (helper.fact_subjects (repr $facts))))
-         (let $beliefs (query-failure (catch (subject-beliefs $subjects)))
-           (sread (py-call (helper.drop_denied (repr $facts) (repr $beliefs))))))))
+;; FACT-RECORDS (rollback):
+;; (= (without-denied $facts)
+;;    (if (== $facts ())
+;;        ()
+;;        (let $subjects (sread (py-call (helper.fact_subjects (repr $facts))))
+;;          (let $beliefs (query-failure (catch (subject-beliefs $subjects)))
+;;            (sread (py-call (helper.drop_denied (repr $facts) (repr $beliefs))))))))
+
+; A denied fact is removed rather than believed false, so no stored fact is denied.
+(= (without-denied $facts) $facts)
 
 ; Recall from the words of the message alone, used when no extraction reply is available.
 (= (recall-facts $msg)

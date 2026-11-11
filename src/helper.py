@@ -169,7 +169,10 @@ def is_send_call(command):
 
 # Skills that bring knowledge from outside DAS: the web, the shell (curl, files)
 # and the embedding memory. groundedAnswers hides and refuses them.
-UNGROUNDED_SKILLS = ("websearch", "shell", "query")
+# Skills groundedAnswers turns off: reading knowledge from outside DAS, and
+# writing to DAS by hand, which small models do with malformed atoms such as
+# (orlando's state florida) although stated facts are learned automatically.
+UNGROUNDED_SKILLS = ("websearch", "shell", "query", "das-store", "das-forget", "believe")
 
 
 def is_ungrounded_call(command):
@@ -256,6 +259,9 @@ def _drop_acknowledgement(text, message):
     stripped = re.sub(rf"(?i)^{address}['\"`_]*noted\s*[:,.!\-\u2014]*\s*", "", text)
     if speaker:
         stripped = re.sub(rf"(?i)^@?{re.escape(speaker)}\s*,\s*", "", stripped)
+    # An answer to a question copied from an earlier acknowledgement: "Got it, Miami is...".
+    if "?" in _latest_text(message):
+        stripped = re.sub(r"(?i)^got\s+it\s*[,:.!\-\u2014]+\s*", "", stripped)
     if stripped and stripped != text:
         stripped = stripped[0].upper() + stripped[1:]
     return stripped or text
@@ -312,6 +318,8 @@ def clean_reply(reply, message=""):
     commands = "|".join(re.escape(cmd) for cmd in sorted(LLM_COMMANDS | {"learn"}))
     text = re.sub(rf"(?:\s*\((?:{commands})\b[^()]*\))+\s*$", "", text)
     text = _drop_duplicated_wrap(text.strip())
+    # The skill name repeated inside the text: "skill: send, ..." or "send: ...".
+    text = re.sub(r"(?i)^\s*(?:skill\s*:\s*)?send\s*[,:]\s*", "", text)
     text = _unwrap_reply(_unwrap_list(_unwrap_parentheses(_unwrap_reply(text))))
     text = _unwrap_reply(_drop_acknowledgement(text, message))
     text = _drop_unpaired_trailing_quotes(text)
@@ -421,6 +429,19 @@ def _place_relation(relation, value, message):
     return None
 
 
+MEMBERSHIP_PREFIX = "is_a_"
+
+
+def _membership_relation(relation):
+    """'is a city of', 'a city in' as the one token is_a_city_of, so it fits the relation limit, else None."""
+    words = list(relation)
+    if words and words[0] in ("is", "are"):
+        words = words[1:]
+    if len(words) < 3 or words[0] not in FACT_ARTICLES or words[-1] not in ("of", "in", "within") or len(words) > 4:
+        return None
+    return [MEMBERSHIP_PREFIX + "_".join(words[1:])]
+
+
 def _fact_fields(text, count, message):
     """The '|'-separated fields of a fact, or None when they do not form one short fact."""
     fields = [_fact_words(field) for field in _plain_text(text).split("|")]
@@ -434,6 +455,10 @@ def _fact_fields(text, count, message):
             place = _place_relation(fields[1], fields[2], message)
             if place:
                 fields[1], fields[2] = place
+            else:
+                membership = _membership_relation(fields[1])
+                if membership:
+                    fields[1] = membership
     if any(len(words) > limit for words, limit in zip(fields, FACT_MAX_WORDS)):
         return None
     if any(len(words) == 1 and words[0] in FACT_PLACEHOLDERS for words in fields):
@@ -1165,6 +1190,25 @@ def describe_facts(facts, message=""):
                      for fact in found for subject, relation, value, who, when, _ in [fact]) + "."
 
 
+def is_statement(reply, message=""):
+    """True when the message only states or denies facts and asks nothing, so nothing needs recalling."""
+    if "?" in _latest_text(message):
+        return False
+    if any(_extraction_entries(reply, tag) for tag in ("LOOKUP", "ALL", "ANY")):
+        return False
+    return bool(_extraction_entries(reply, "FACT") or _extraction_entries(reply, "NOT"))
+
+
+def describe_learned(learned, message=""):
+    """The facts a statement just stored, (LEARNED "s" "r" "v") or (DENIED ...), as sentences to the sender."""
+    speaker = message_speaker(message)
+    found = re.findall(r'\((LEARNED|DENIED)\s+"([^"]*)"\s+"([^"]*)"\s+"([^"]*)"\)', str(learned or ""))
+    if not found:
+        return "nothing was stored from this message"
+    return "just stored: " + "; ".join(_fact_sentence(subject, relation, value, speaker, denied=(kind == "DENIED"))
+                                       for kind, subject, relation, value in found) + "."
+
+
 def describe_known_facts(facts, keys, message=""):
     """describe_facts, or which names have nothing stored, so the agent says so rather than answering from elsewhere."""
     text = describe_facts(facts, message)
@@ -1215,8 +1259,20 @@ def starts_command_line(line):
         s = s[1:].lstrip()
     if not s:
         return False
-    first = s.split(maxsplit=1)[0].rstrip(")")
+    first = s.split(maxsplit=1)[0].rstrip("),:")
     return first in LLM_COMMANDS or _glued_send_arg(first) is not None
+
+
+THINK_BLOCK = re.compile(r"(?is)<think>.*?(?:</think>|$)")
+SKILL_LABEL = re.compile(r"(?im)^(\s*)skill\s*:\s*")
+
+
+def _strip_skill_labels(text):
+    """A reply without <think> blocks and with 'skill: send ...' lines read as 'send ...'.
+
+    Small models label each line or think aloud before the skill lines.
+    """
+    return SKILL_LABEL.sub(r"\1", THINK_BLOCK.sub("", text))
 
 def split_command_blocks(s):
     blocks = []
@@ -1235,8 +1291,22 @@ def split_command_blocks(s):
         blocks.append("\n".join(cur).strip())
     return blocks
 
-def balance_parentheses(s):
-    s = s.replace("_quote_", '"').replace("_newline_", "\n")
+def balance_parentheses(s, reply_open=False):
+    """Skill lines as one expression of skill calls.
+
+    With reply_open, a response that is only prose is the answer written
+    without its send, as small models do, so it is sent rather than rejected.
+    """
+    s = _strip_skill_labels(s.replace("_quote_", '"').replace("_newline_", "\n"))
+    ret = _skill_calls(s)
+    prose = s.strip()
+    if is_enabled(reply_open) and prose and ret != "()" and all(
+            call.startswith("(Error UNKNOWN_SKILL_CALL ") for call in re.findall(r"\((?:[^()\"]|\"(?:\\.|[^\"\\])*\")*\)", ret[1:-1])):
+        return f"((send {quote_arg(prose)}))"
+    return ret
+
+
+def _skill_calls(s):
     sexprs = []
     for line in split_command_blocks(s):
         line = line.strip()
@@ -1254,7 +1324,7 @@ def balance_parentheses(s):
         parts = line.split(maxsplit=1)
         if not parts:
             continue
-        cmd = parts[0]
+        cmd = parts[0].rstrip(",:")
         rest = parts[1].strip() if len(parts) > 1 else ""
         glued = _glued_send_arg(cmd)
         if glued is not None:

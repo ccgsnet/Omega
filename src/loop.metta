@@ -104,13 +104,23 @@
 ; same_<attribute>_as fact carries the other side's value of the attribute
 ; over, so "miami same_state_as orlando" with "orlando state florida" also
 ; reads "miami's state is florida", even when each was stored by another agent.
+; A message that only states facts asks nothing, so it is answered from the
+; facts just stored and DAS is not queried. send skips a reply equal to the
+; last one, which holds within one message only: a new message may get the same
+; words again.
 (= (remember-message $msg)
-   (let* (($reply (extract-from-message $msg))
-          ($_ (learn-from-reply $reply))
-          ($speaker (sread (py-call (helper.speaker_literal $msg))))
+   (let* (($_ (change-state! &lastsend ""))
+          ($reply (extract-from-message $msg))
+          ($learned (learn-from-reply $reply))
           ($keys (recall-keys $msg $reply))
-          ($_ (progn (change-state! &lastFactKeys $keys)
-                     (log INFO "das-memory" (DAS_RECALL_KEYS $keys))))
+          ($_ (change-state! &lastFactKeys $keys)))
+     (if (py-call (helper.is_statement $reply $msg))
+         (change-state! &knownFacts (py-call (helper.describe_learned (repr $learned) $msg)))
+         (recall-for-message $msg $reply $keys))))
+
+(= (recall-for-message $msg $reply $keys)
+   (let* (($speaker (sread (py-call (helper.speaker_literal $msg))))
+          ($_ (log INFO "das-memory" (DAS_RECALL_KEYS $keys)))
           ($facts (recall-facts-for $speaker $keys))
           ($joint (conjunction-facts (sread (py-call (helper.extracted_conjunction $reply $msg)))))
           ($found (unique-atom (union-atom $facts $joint)))
@@ -124,7 +134,7 @@
 ; Plugins call send directly and are not affected.
 (= (run-skill $s $replyopen)
    (if (and (groundedAnswers) (py-call (helper.is_ungrounded_call (repr $s))))
-       (SKILL_DISABLED "answer only from KNOWN_FACTS; if they hold nothing about it, say you do not know it yet")
+       (SKILL_DISABLED "stated facts are stored automatically and answers come only from KNOWN_FACTS; just reply with send")
        (if (or $replyopen (not (py-call (helper.is_send_call (repr $s)))))
            (eval $s)
            (SEND_SKIPPED "no new or unanswered user message"))))
@@ -145,6 +155,7 @@
                          " For UNANSWERED-HUMAN-MSG, send the answer built from its RESULTS_GATHERED_FOR_IT. Do not repeat a skill call already shown there." (newline)
                          " KNOWN_FACTS are learned facts related to the user message, written to the user: your means the user's, never yours." (newline)
                          " Answer questions from KNOWN_FACTS in the same person, for example: Your favorite color is blue. Never invent a fact that is not there." (newline)
+                         " When KNOWN_FACTS starts with just stored, the user only told you something: acknowledge just that in one short sentence, for example: send Got it, Miami is called the Magic City. Do not repeat earlier answers or other facts. When KNOWN_FACTS says nothing was stored, tell the user you could not store it and ask them to say it more simply." (newline)
                          (groundedRule)
                          " Use unlearn only to remove a fact that is no longer true." (newline)
                          " SAVE_PERMANENT_FILES_DIR: " (memoryDirectory)
@@ -219,7 +230,7 @@
                                        ($send (py-str ($prompt :-:-:-: $lastmessage)))
                                        ($_ (log INFO "loop" (CHARS_SENT: (string_length $send) $send)))
                                        ($respi (llmProviderChat $send (maxOutputToken) (reasoningMode)))
-                                       ($resp (py-call (helper.balance_parentheses $respi)))
+                                       ($resp (py-call (helper.balance_parentheses $respi $replyopen)))
                                        ($response (if (== "(" (first_char $resp)) $resp (progn (log INFO "loop" $resp) (repr (REMEMBER:OUTPUT_NOTHING_ELSE_THAN: ((skill arg) ...))))))
                                        ($sexpr (catch (sread $response)))
                                        ($_ (change-state! &error ()))

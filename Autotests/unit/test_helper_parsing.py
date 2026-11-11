@@ -446,6 +446,10 @@ def test_grounded_answers_refuse_outside_knowledge(helper):
     assert helper.is_ungrounded_call('(query "orlando")')
     assert not helper.is_ungrounded_call('(send "Orlando is in Florida.")')
     assert not helper.is_ungrounded_call('(metta "(+ 1 2)")')
+    assert helper.is_ungrounded_call('(das-store "(orlando\'s state florida)")')
+    assert not helper.is_ungrounded_call('(das-recall "(Today $1 $2)")')
+    assert not helper.skill_line_allowed(
+        "- Store one grounded MeTTa atom in DAS formal memory, no variables: das-store sexpression", True)
     assert not helper.skill_line_allowed("- Search the web: websearch string", "True")
     assert not helper.skill_line_allowed("- Query long-term embedding memory for skills and memories with short phrases only: query string", True)
     assert helper.skill_line_allowed("- Search the web: websearch string", "False")
@@ -705,3 +709,49 @@ def test_extract_timestamp_parses_leading_history_stamp(helper):
 
 def test_extract_timestamp_returns_none_when_absent(helper):
     assert helper.extract_timestamp("no timestamp here") is None
+
+
+# --- labelled skill lines and statements ------------------------------------
+
+def test_balance_parentheses_reads_labelled_skill_lines(helper):
+    assert helper.balance_parentheses("send, Yes it is.") == '((send "Yes it is."))'
+    assert helper.balance_parentheses("skill: send_newline_Got it.") == '((send "Got it."))'
+    assert helper.balance_parentheses(
+        "<think>_newline_Already answered.</think>_newline_skill: send Got it.") == '((send "Got it."))'
+    assert helper.clean_reply('skill: send, "Got it."') == "Got it."
+
+
+def test_statements_need_no_recall(helper):
+    message = "arturgontijo: Orlando is called the City Beautiful."
+    assert helper.is_statement("FACT Orlando | nickname | City Beautiful", message)
+    assert not helper.is_statement("LOOKUP Miami", "arturgontijo: What do you know about Miami?")
+    assert not helper.is_statement("FACT Miami | state | florida", "arturgontijo: Is Miami in Florida?")
+    assert helper.describe_learned('((LEARNED "orlando" "nickname" "city beautiful"))', message) == \
+        "just stored: orlando's nickname is city beautiful."
+
+
+def test_balance_parentheses_sends_bare_prose_while_a_reply_is_open(helper):
+    assert helper.balance_parentheses("Got it, Orlando is in Florida.", "True") == \
+        '((send "Got it, Orlando is in Florida."))'
+    assert helper.balance_parentheses("Got it, Orlando is in Florida.") == \
+        '((Error UNKNOWN_SKILL_CALL "Got it, Orlando is in Florida."))'
+    assert helper.balance_parentheses("Noted_newline_pin task", True) == \
+        '((Error UNKNOWN_SKILL_CALL "Noted") (pin "task"))'
+
+
+def test_clean_reply_drops_got_it_from_answers(helper):
+    question = "arturgontijo: What do you know about Miami?"
+    assert helper.clean_reply("Got it, Miami is called the Magic City.", question) == "Miami is called the Magic City."
+    assert helper.clean_reply("Got it, Miami is called the Magic City.", "arturgontijo: Miami is called the Magic City.") == \
+        "Got it, Miami is called the Magic City."
+
+
+def test_membership_relation_fits_the_relation_limit(helper):
+    message = "arturgontijo: New York is a city of the United States."
+    assert helper.parse_fact("New York | is a city of | United States", message) == \
+        '("new york" "is_a_city_of" "united states")'
+    assert helper.describe_facts('(("new york" "is_a_city_of" "united states"))', message) == \
+        "new york is a city of united states."
+    assert helper.parse_fact("Orlando | is a city of | Florida", "arturgontijo: Orlando is a city of the Florida state.") == \
+        '("orlando" "state" "florida")'
+    assert helper.describe_learned("((FACT_NOT_LEARNED \"x\" \"y\"))") == "nothing was stored from this message"
