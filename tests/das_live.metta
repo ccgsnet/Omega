@@ -8,6 +8,8 @@
 !(import! &self ./tests/lib/utils)
 !(import! &self ../src/helper.py)
 !(import! &self ./src/utils)
+!(import! &self ../src/config.py)
+!(import! &self ./src/config)
 !(import! &self ./lib_nal)
 !(import! &self ./lib_pln)
 !(import! &self ./src/das_memory)

@@ -117,15 +117,17 @@
           ($more (expand-subjects $found $keys $speaker))
           ($merged (py-call (helper.merge_facts (repr (union-atom $found $more)))))
           ($known (sread (py-call (helper.infer_shared_facts $merged)))))
-     (change-state! &knownFacts (describe-facts $known $msg))))
+     (change-state! &knownFacts (py-call (helper.describe_known_facts (repr $known) (repr $keys) $msg)))))
 
 ; Small models often send idle chatter such as "No new user input." despite the
 ; prompt, so a send is only run while a user message is waiting for a reply.
 ; Plugins call send directly and are not affected.
 (= (run-skill $s $replyopen)
-   (if (or $replyopen (not (py-call (helper.is_send_call (repr $s)))))
-       (eval $s)
-       (SEND_SKIPPED "no new or unanswered user message")))
+   (if (and (groundedAnswers) (py-call (helper.is_ungrounded_call (repr $s))))
+       (SKILL_DISABLED "answer only from KNOWN_FACTS; if they hold nothing about it, say you do not know it yet")
+       (if (or $replyopen (not (py-call (helper.is_send_call (repr $s)))))
+           (eval $s)
+           (SEND_SKIPPED "no new or unanswered user message"))))
 
 (= (initKnowledge)
    (progn (log INFO "loop" "Initializing knowledge base")
@@ -143,11 +145,18 @@
                          " For UNANSWERED-HUMAN-MSG, send the answer built from its RESULTS_GATHERED_FOR_IT. Do not repeat a skill call already shown there." (newline)
                          " KNOWN_FACTS are learned facts related to the user message, written to the user: your means the user's, never yours." (newline)
                          " Answer questions from KNOWN_FACTS in the same person, for example: Your favorite color is blue. Never invent a fact that is not there." (newline)
+                         (groundedRule)
                          " Use unlearn only to remove a fact that is no longer true." (newline)
                          " SAVE_PERMANENT_FILES_DIR: " (memoryDirectory)
                          " LAST_SKILL_USE_RESULTS: " (last_chars (get-state &lastresults) (maxFeedback))
                          " HISTORY: " (getHistory) 
                          " TIME: " (get_time_as_string)))))
+
+(= (groundedRule)
+   (if (groundedAnswers)
+       (py-str (" KNOWN_FACTS is all you know, read from DAS: answer only with those facts and what follows from them by reasoning, never from your own knowledge or the web; there is no query to run."
+                " When KNOWN_FACTS says nothing is stored about a name, tell the user you do not know anything about it yet." (newline)))
+       ""))
 
 (= (addTelegramPromptExtension)
    (if (== (commchannel) telegram)

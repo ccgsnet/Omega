@@ -53,6 +53,13 @@ memoryExportEnabled: false
 # for example "host.docker.internal:40009"; `scripts/omega start --das <host:port>` sets it.
 # Empty keeps `&das` as an in-process space that does not persist across restarts.
 dasRouter: ""
+# Also read facts other agents wrote as bare Evaluations, with no Fact record. The DAS pattern
+# index cannot narrow those by name, so each read scans every Evaluation; several per name looked up.
+# False reads only the indexed Fact records Omega writes: about one query per name.
+dasExternalFacts: False
+# Answer only from the facts recalled from DAS and reasoning over them: websearch, shell and
+# query are hidden and refused, and a name with nothing stored is answered as unknown.
+groundedAnswers: True
 # Extract facts and lookup names from each user message with a separate model call
 autoLearnFacts: True
 # Output cap passed to the provider for that extraction call; reasoning models spend most of it thinking.

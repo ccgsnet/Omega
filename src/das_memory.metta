@@ -134,12 +134,20 @@
 (= (fact-term $s $r $v)
    (sread (py-call (helper.fact_term $s $r $v))))
 
+; The DAS pattern index keys a link by its top-level targets only, so a pattern
+; whose names sit inside the nested Evaluation, as every Belief, Stated and bare
+; Evaluation query here does, reads every link of that type and matches each in
+; the query engine. A learned fact is therefore also written as one record per
+; name it holds, (Fact (Concept "name") <term> <truth> (Stated "who" "when")),
+; with the name a top-level target: one indexed query returns a name's facts,
+; both sides, with truth and source. Belief and Stated stay the facts' form for
+; |~, beliefs and other agents; the records are kept in step with them.
 (= (relation-values $s $r)
-   (collapse (match &das (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $tv) $found)))
+   (collapse (match &das (Fact (Concept $s) (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) $tv $src) $found)))
 
 ; The values of a relation with the strength each is believed at: (("tea" 1.0) ("coffee" 0.0)).
 (= (relation-truths $s $r)
-   (collapse (match &das (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) (stv $f $c)) ($found $f))))
+   (collapse (match &das (Fact (Concept $s) (Evaluation (Predicate $r) (List (Concept $s) (Concept $found))) (stv $f $c) $src) ($found $f))))
 
 ; In DAS the Evaluation nested in a removed Belief stays as a link of its own
 ; and would be read back as a fact from another agent, so it is removed too;
@@ -149,6 +157,8 @@
      (progn (map-atom (collapse (match &das (Belief $term $tv) $tv)) $tv (remove-atom &das (Belief $term $tv)))
             (map-atom (collapse (match &das (Stated $term $who $when) ($who $when))) $p
                       (let ($who $when) $p (remove-atom &das (Stated $term $who $when))))
+            (map-atom (collapse (match &das (Fact $key $term $tv $src) ($key $tv $src))) $p
+                      (let ($key $tv $src) $p (remove-atom &das (Fact $key $term $tv $src))))
             (catch (remove-atom &das $term)))))
 
 ; A value already believed at the same strength is KNOWN; one believed at the
@@ -164,7 +174,9 @@
                 ($who (sread (py-call (helper.speaker_literal (current-message)))))
                 ($when (get_time_as_string))
                 ($_ (add-atom &das (Belief $term $tv)))
-                ($_ (add-atom &das (Stated $term $who $when))))
+                ($_ (add-atom &das (Stated $term $who $when)))
+                ($_ (add-atom &das (Fact (Concept $s) $term $tv (Stated $who $when))))
+                ($_ (if (== $s $v) () (add-atom &das (Fact (Concept $v) $term $tv (Stated $who $when))))))
            ($report $s $r $v)))))
 
 (= (store-fact $s $r $v) (store-fact-as $s $r $v (factTruth) LEARNED))
@@ -194,36 +206,46 @@
 (= (describe-facts $facts $msg)
    (py-call (helper.describe_facts (repr $facts) $msg)))
 
-; Concept names looked up per message besides the sender. Each name is three
-; DAS queries, as subject, as value and as subject of a three-place record,
-; so this bounds the delay per message.
+; Concept names looked up per message besides the sender. Each name is one
+; indexed query, plus scans when external facts are read, so this bounds the
+; delay per message.
 (= (maxFactConcepts) 3)
 
 ; Facts about $key and facts whose value is $key, as
 ; ("subject" "relation" "value" "who" "when" strength).
-; Learned facts are read with one conjunction of their Belief and Stated
-; links per side, so each comes with its truth (1.0 stated, 0.0 denied) and
-; its source, which answers "who told you that?" and "when?" with no further
-; query. The bare Evaluation form is read as well: that is what other agents
-; on the same router write, with no source and taken as true, and also where
-; beliefs derived by |- or |~ end up. Other agents keep the spelling of the
-; user, so the key is tried as written in the message and in Title Case
-; besides lowercase. A three-place record (subject, value, value) is read as
-; one value. Both forms run every time, because a name may have facts from
-; both sides ("team a" learned here and loaded by another agent); a learned
-; fact's own nested Evaluation also answers the bare query, and merge_facts
-; drops that copy in favour of the one with its source and truth.
-; A user function inside a superpose list is collected as one list, so the
-; match calls are written out.
-(= (stated-facts-about $key)
-   (collapse (superpose ((match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) (stv $f $c))
-                                        (Stated (Evaluation (Predicate $r) (List (Concept $key) (Concept $v))) $who $when))
-                                ($key $r $v $who $when $f))
-                         (match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) (stv $f $c))
-                                        (Stated (Evaluation (Predicate $r) (List (Concept $s) (Concept $key))) $who $when))
-                                ($s $r $key $who $when $f))))))
+; Learned facts are read from the Fact records of $key, so each comes with its
+; truth (1.0 stated, 0.0 denied) and its source, which answers "who told you
+; that?" and "when?" with no further query. With dasExternalFacts the bare
+; Evaluation form is read as well: that is what other agents on the same
+; router write, with no source and taken as true, and also where beliefs
+; derived by |- or |~ end up. Other agents keep the spelling of the user, so
+; the key is tried as written in the message and in Title Case besides
+; lowercase. A three-place record (subject, value, value) is read as one value.
+; Both forms run every time, because a name may have facts from both sides
+; ("team a" learned here and loaded by another agent); a learned fact's own
+; nested Evaluation also answers the bare query, and merge_facts drops that
+; copy in favour of the one with its source and truth.
 
-; superpose takes a bound list, not a call: the variants are bound first.
+; The learned facts naming $key, either side, from its Fact records: one indexed query.
+(= (stated-facts-about $key)
+   (collapse (match &das (Fact (Concept $key) (Evaluation (Predicate $r) (List (Concept $s) (Concept $v))) (stv $f $c) (Stated $who $when))
+                    ($s $r $v $who $when $f))))
+
+; The learned facts with $name as subject. The subject is bound in the nested
+; term as well, which the query engine checks on the records the index returned.
+(= (stated-facts-of $name)
+   (collapse (match &das (Fact (Concept $name) (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) (stv $f $c) (Stated $who $when))
+                    ($name $r $v $who $when $f))))
+
+; Bare Evaluations are what other agents on the router write, with no Fact
+; record. Reading them scans every Evaluation in every AtomDB, several times
+; per name, so dasExternalFacts False skips it when only Omega agents write.
+(= (readExternalFacts)
+   (py-call (helper.is_enabled (configGetByKey dasExternalFacts True))))
+
+; superpose takes a bound list, not a call: the variants are bound first. A
+; user function inside a superpose list is collected as one list, so the match
+; calls are written out.
 (= (external-facts-about $key)
    (let $names (sread (py-call (helper.name_variants $key (current-message))))
      (let $name (superpose $names)
@@ -234,18 +256,23 @@
 
 (= (facts-about $key)
    (let $stated (stated-facts-about $key)
-     (let $external (collapse (external-facts-about $key))
-       (superpose (union-atom $stated $external)))))
+     (if (readExternalFacts)
+         (let $external (collapse (external-facts-about $key))
+           (superpose (union-atom $stated $external)))
+         (superpose $stated))))
 
-; The facts of one subject spelled as stored, both forms, as subject only:
-; three queries, where facts-about runs up to eleven for the name variants.
-(= (subject-facts $name)
-   (collapse (superpose ((match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) (stv $f $c))
-                                        (Stated (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) $who $when))
-                                ($name $r $v $who $when $f))
-                         (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" "" 1.0))
+(= (external-subject-facts $name)
+   (collapse (superpose ((match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v))) ($name $r $v "" "" 1.0))
                          (match &das (Evaluation (Predicate $r) (List (Concept $name) (Concept $v) (Concept $w)))
                                 (let $joined (sread (py-call (helper.join_values $v $w))) ($name $r $joined "" "" 1.0)))))))
+
+; The facts of one subject spelled as stored, as subject only: one indexed
+; query, and two scans when external facts are read.
+(= (subject-facts $name)
+   (let $stated (stated-facts-of $name)
+     (if (readExternalFacts)
+         (union-atom $stated (external-subject-facts $name))
+         $stated)))
 
 ; A fact recalled from its value side names a subject the message did not:
 ; "Team A founded_in Brasília" for the key "brasília". The question is usually
@@ -255,7 +282,7 @@
 ; that were keys, or the sender, are already read in full, except the other
 ; spelling of a key whose facts came back only under Omega's lowercase form.
 (= (expand-subjects $facts $keys $speaker)
-   (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts) (current-message))))
+   (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts) (current-message) (readExternalFacts))))
      (if (== $subjects ())
          ()
          (let $more (recall-failure
@@ -283,10 +310,9 @@
 ; The sender is looked up as a subject only; the other names from both sides.
 (= (recall-facts-for $speaker $keys)
    (recall-failure
-     (catch (unique-atom (collapse (superpose ((match &das (, (Belief (Evaluation (Predicate $r) (List (Concept $speaker) (Concept $v))) (stv $f $c))
-                                                              (Stated (Evaluation (Predicate $r) (List (Concept $speaker) (Concept $v))) $who $when))
-                                                      ($speaker $r $v $who $when $f))
-                                               (let $key (superpose $keys) (facts-about $key)))))))))
+     (catch (let $own (stated-facts-of $speaker)
+              (let $others (collapse (let $key (superpose $keys) (facts-about $key)))
+                (unique-atom (union-atom $own $others)))))))
 
 ; A question about something that must meet several conditions at once, such
 ; as "which team has a blue logo and won in 2009", is extracted as

@@ -167,6 +167,24 @@ def is_send_call(command):
     return skill_names(f"({command})") == ["send"]
 
 
+# Skills that bring knowledge from outside DAS: the web, the shell (curl, files)
+# and the embedding memory. groundedAnswers hides and refuses them.
+UNGROUNDED_SKILLS = ("websearch", "shell", "query")
+
+
+def is_ungrounded_call(command):
+    """True when one skill call, as printed by repr, reads knowledge from outside DAS."""
+    return any(name in UNGROUNDED_SKILLS for name in skill_names(f"({command})"))
+
+
+def skill_line_allowed(line, grounded):
+    """False for the description of a skill groundedAnswers turns off, such as '- Search the web: websearch string'."""
+    if not is_enabled(grounded):
+        return True
+    match = re.match(r"\s*-\s.*?:\s*([\w-]+)", normalize_string(line))
+    return not (match and match.group(1) in UNGROUNDED_SKILLS)
+
+
 REPLY_MARKERS = (("_quote_", '"'), ("_newline_", "\n"), ("_apostrophe_", "'"))
 REPLY_QUOTES = (('"', '"'), ("'", "'"), ("`", "`"), ("_", "_"), ("*", "*"),
                 ("\u201c", "\u201d"), ("\u00ab", "\u00bb"))
@@ -1060,7 +1078,7 @@ def fact_subjects(facts):
     return _strings(*subjects)
 
 
-def new_subjects(facts, keys, speaker="", limit=3, message=""):
+def new_subjects(facts, keys, speaker="", limit=3, message="", external=True):
     """Subjects of recall tuples that were not looked up themselves, spelled as stored.
 
     A fact found from its value side, "Team A founded_in Brasília" for the key
@@ -1079,7 +1097,10 @@ def new_subjects(facts, keys, speaker="", limit=3, message=""):
     recalled tuples do not yet include the other agents' spelling ("Team A"),
     that spelling is added too. facts-about tries both, but a slow first round
     can return only the learned fact; the second round then reads the rest.
+    Without external facts there is no other spelling to read, and only the
+    names as stored are given.
     """
+    external = is_enabled(external)
     key_list = re.findall(r'"([^"]*)"', str(keys or ""))
     known_exact = set(key_list)
     known = {str(k).lower() for k in key_list}
@@ -1098,7 +1119,7 @@ def new_subjects(facts, keys, speaker="", limit=3, message=""):
             add(fact[0])
     for fact in _fact_tuples(facts):
         add(fact[0])
-    for key in key_list:
+    for key in key_list if external else []:
         if not _latest_text(message) or key.lower() not in have_lower:
             continue
         for variant in re.findall(r'"([^"]*)"', name_variants(key, message)):
@@ -1108,7 +1129,7 @@ def new_subjects(facts, keys, speaker="", limit=3, message=""):
                 subjects.append(variant)
     names = []
     for subject in subjects[:int(limit)]:
-        for name in (subject, subject.lower()):
+        for name in (subject, subject.lower()) if external else (subject,):
             if name not in names and name not in known_exact:
                 names.append(name)
     return _strings(*names)
@@ -1142,6 +1163,15 @@ def describe_facts(facts, message=""):
     found.sort(key=lambda fact: fact[4], reverse=True)
     return "; ".join(_fact_sentence(subject, relation, value, speaker, denied=_denied(fact)) + _fact_source(who, when, speaker)
                      for fact in found for subject, relation, value, who, when, _ in [fact]) + "."
+
+
+def describe_known_facts(facts, keys, message=""):
+    """describe_facts, or which names have nothing stored, so the agent says so rather than answering from elsewhere."""
+    text = describe_facts(facts, message)
+    names = re.findall(r'"([^"]*)"', str(keys or ""))
+    if text != "none" or not names:
+        return text
+    return f"none, nothing is stored about {' or '.join(names)}"
 
 
 def fact_query_keys(message, limit=3, names_only=False):
@@ -1288,6 +1318,12 @@ def getenv(key, default=""):
 def is_set(x):
     """True when x is non-empty text. A MeTTa bool reaches Python as text, so no flag argument."""
     return x is not None and bool(str(x).strip())
+
+def is_enabled(x):
+    """True for a true flag, whether it comes as a bool, as MeTTa text or from the command line ("true", "1", "yes")."""
+    if isinstance(x, bool):
+        return x
+    return normalize_string(x).strip().lower() in ("true", "1", "yes", "on", "enabled")
 
 def joinPath(parts):
     return os.path.join(*parts)

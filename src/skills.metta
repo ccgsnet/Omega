@@ -1,6 +1,13 @@
 (= (getSkills)
    (let $static (getStaticSkills)
-     (collapse (superpose ((superpose $static) (dynamic-skill $_))))))
+     (collapse (let $line (superpose ((superpose $static) (dynamic-skill $_)))
+                 (if (py-call (helper.skill_line_allowed $line (groundedAnswers))) $line (empty))))))
+
+; With groundedAnswers the agent answers from DAS alone: the skills that read
+; the web, the shell or the embedding memory are left out of SKILLS, and
+; run-skill refuses them if the model writes one anyway.
+(= (groundedAnswers)
+   (py-call (helper.is_enabled (configGetByKey groundedAnswers False))))
 
 ; dynamic skill placeholder to eliminate error when no dynamic skill is added
 (= (dynamic-skill placeholder) (empty))

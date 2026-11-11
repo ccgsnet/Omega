@@ -23,6 +23,7 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | `reasoningMode` | `medium` | Reasoning-effort hint passed to the provider (`reasoning_effort` on OpenAI-compatible endpoints). |
 | `wakeupInterval` | 600 (seconds) | How long idle before the next scheduled wake-up. |
 | `idleThinking` | `True` | Call the model on turns with no new or unanswered user message. `False` calls it only for a new message and the reply turns after it, which also disables scheduled wake-up work; `config/config.yaml` sets `False`. |
+| `groundedAnswers` | `False` | Answer only from the facts recalled from DAS (`KNOWN_FACTS`) and reasoning over them. `websearch`, `shell` and `query` are left out of the skill list and refused when called, and a question about a name with nothing stored reads `KNOWN_FACTS: none, nothing is stored about <name>`. `config/config.yaml` sets `True`. |
 
 ## Memory (`src/memory.metta`, `initMemory`)
 
@@ -42,6 +43,7 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | Key | Default | Description |
 |---|---|---|
 | `dasRouter` | empty | `host:port` of the DAS Command Router that backs the `&das` space holding facts and beliefs, for example `host.docker.internal:40009`. `scripts/omega start --das <host:port>` sets it. Empty keeps `&das` an in-process space that does not persist across restarts. Read before the loop starts, so it must come from the command line, `OMEGA_dasRouter` or the config file. |
+| `dasExternalFacts` | `True` | Also recall the facts other agents wrote as bare `Evaluation` atoms. Omega's own facts are read from `(Fact (Concept name) ...)` records, one indexed DAS query per name; the DAS pattern index cannot narrow a bare `Evaluation` by a name nested inside it, so each external read scans every `Evaluation` in every AtomDB, several per name. `config/config.yaml` sets `False`. |
 | `autoLearnFacts` | `True` | Make one extra model call per user message to extract the facts it states (`FACT subject \| relation \| value`), the facts it denies (`NOT subject \| relation \| value`), the names it asks about (`LOOKUP name`) and the conditions it joins (`ALL`/`ANY value \| value`). |
 | `factExtractionTokens` | 4000 | Output cap passed to the provider for that extraction call. Reasoning models spend most of it thinking; at 1000 `ornith-1.5:9b` ran out before answering. When the model runs out, the call is retried once with twice the cap; if that fails too the message is logged as `FACTS_NOT_EXTRACTED` and nothing is learned. |
 | `factExtractionReasoning` | `reasoningMode` | Reasoning-effort hint for the extraction call only. The OpenAI-compatible provider sends it as `reasoning_effort`; Ollama accepts `none`, `low`, `medium`, `high` (`none` disables thinking, which is fast but sloppier). Providers that reject the parameter are detected once and the hint is dropped for the rest of the run. |

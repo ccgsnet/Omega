@@ -416,6 +416,11 @@ def test_same_attribute_facts_read_the_other_side_and_carry_its_value(helper):
         '(("miami" "same_state_as" "orlando" "bob" "2026-11-10 10:05:00" 1.0)'
         ' ("miami" "nickname" "magic city" "bob" "2026-11-10 10:06:00" 1.0))')
     assert helper.new_subjects(about_miami, '("miami")', "carol", 3) == '("orlando")'
+    # Without external facts no other spelling is read: Title Case "Miami" costs no query.
+    asked = "carol: What do you know about Miami?"
+    assert helper.new_subjects(about_miami, '("miami")', "carol", 3, asked) == '("orlando" "Miami")'
+    assert helper.new_subjects(about_miami, '("miami")', "carol", 3, asked, "False") == '("orlando")'
+    assert helper.is_enabled("true") and helper.is_enabled(True) and not helper.is_enabled("False")
     with_orlando = about_miami[:-1] + (
         ' ("orlando" "state" "florida" "ana" "2026-11-10 10:00:00" 1.0)'
         ' ("orlando" "nickname" "city beautiful" "ana" "2026-11-10 10:01:00" 1.0))')
@@ -433,6 +438,23 @@ def test_same_attribute_facts_read_the_other_side_and_carry_its_value(helper):
         ' ("orlando" "state" "florida" "" "" 1.0))')
     assert "inferred" not in helper.infer_shared_facts(
         '(("miami" "same_state_as" "orlando" "bob" "" 0.0) ("orlando" "state" "florida" "" "" 1.0))')
+
+
+def test_grounded_answers_refuse_outside_knowledge(helper):
+    assert helper.is_ungrounded_call('(websearch "Orlando")')
+    assert helper.is_ungrounded_call("(shell \"'das-recall (Evaluation ...)'\")")
+    assert helper.is_ungrounded_call('(query "orlando")')
+    assert not helper.is_ungrounded_call('(send "Orlando is in Florida.")')
+    assert not helper.is_ungrounded_call('(metta "(+ 1 2)")')
+    assert not helper.skill_line_allowed("- Search the web: websearch string", "True")
+    assert not helper.skill_line_allowed("- Query long-term embedding memory for skills and memories with short phrases only: query string", True)
+    assert helper.skill_line_allowed("- Search the web: websearch string", "False")
+    assert helper.skill_line_allowed("- Send message to user: send string", True)
+    assert helper.skill_line_allowed("metta (|- ((--> (× sam garfield) friend) (stv 1.0 0.9))", True)
+    assert helper.describe_known_facts("()", '("orlando")') == "none, nothing is stored about orlando"
+    assert helper.describe_known_facts("()", "()") == "none"
+    assert helper.describe_known_facts('(("orlando" "state" "florida" "" "" 1.0))', '("orlando")') == (
+        "orlando's state is florida.")
 
 
 def test_conjunction_queries_pair_each_value_with_the_first_in_every_spelling(helper):
