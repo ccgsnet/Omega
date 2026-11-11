@@ -252,7 +252,15 @@ def _unwrap_parentheses(text):
     return text
 
 
-def _drop_acknowledgement(text, message):
+def _answers_question(message, facts=""):
+    """True when the turn answers a question: the message asks, or its KNOWN_FACTS were recalled rather than just stored."""
+    if "?" in _latest_text(message):
+        return True
+    facts = str(facts or "").strip()
+    return bool(facts) and not facts.startswith(("just stored", "nothing was stored"))
+
+
+def _drop_acknowledgement(text, message, facts=""):
     """'arturgontijo, noted: Miami is...' as 'Miami is...': the address and the bookkeeping word."""
     speaker = message_speaker(message)
     address = rf"(?:@?{re.escape(speaker)}\s*[,:]\s*)?" if speaker else ""
@@ -260,8 +268,8 @@ def _drop_acknowledgement(text, message):
     if speaker:
         stripped = re.sub(rf"(?i)^@?{re.escape(speaker)}\s*,\s*", "", stripped)
     # An answer to a question copied from an earlier acknowledgement: "Got it, Miami is...".
-    if "?" in _latest_text(message):
-        stripped = re.sub(r"(?i)^got\s+it\s*[,:.!\-\u2014]+\s*", "", stripped)
+    if _answers_question(message, facts):
+        stripped = re.sub(r"(?i)^got\s+it\s*[,:.!\-\u2013\u2014]+\s*", "", stripped)
     if stripped and stripped != text:
         stripped = stripped[0].upper() + stripped[1:]
     return stripped or text
@@ -298,7 +306,7 @@ def _drop_duplicated_wrap(text):
     return text
 
 
-def clean_reply(reply, message=""):
+def clean_reply(reply, message="", facts=""):
     """The text of a send as the user should read it.
 
     Small models leak their format into replies: the escape markers of the
@@ -321,7 +329,7 @@ def clean_reply(reply, message=""):
     # The skill name repeated inside the text: "skill: send, ..." or "send: ...".
     text = re.sub(r"(?i)^\s*(?:skill\s*:\s*)?send\s*[,:]\s*", "", text)
     text = _unwrap_reply(_unwrap_list(_unwrap_parentheses(_unwrap_reply(text))))
-    text = _unwrap_reply(_drop_acknowledgement(text, message))
+    text = _unwrap_reply(_drop_acknowledgement(text, message, facts))
     text = _drop_unpaired_trailing_quotes(text)
     lines = text.split("\n")
     if len(lines) > 1 and _echoes(lines[0], _latest_text(message)):
@@ -447,8 +455,21 @@ def _fact_fields(text, count, message):
     fields = [_fact_words(field) for field in _plain_text(text).split("|")]
     if len(fields) != count or not all(fields):
         return None
+    if count == 3:
+        # "miami | koppen climate classification | the same as orlando's": the
+        # link written as a value, which must be a same_<attribute>_as relation.
+        value = fields[2][1:] if fields[2][:1] == ["the"] else fields[2]
+        if value[:2] == ["same", "as"] and len(value) > 2:
+            relation = [w for w in fields[1] if w not in {"is", "are"} | FACT_ARTICLES]
+            if relation:
+                fields[1] = ["same", "_".join(relation), "as"]
+                fields[2] = [re.sub(r"_s$", "", w) for w in value[2:] if w not in FACT_ARTICLES]
     if count >= 2:
         shared = shared_attribute("_".join(fields[1]))
+        # "Miami's climate is not the same as Orlando's" extracted as miami | climate | orlando.
+        if not shared and count == 3 and re.search(
+                rf"(?i)\bsame\s+as\s+(?:the\s+)?{re.escape(' '.join(fields[2]))}\b", _latest_text(message)):
+            shared = "_".join(word for word in fields[1] if word not in {"is", "are"} | FACT_ARTICLES)
         if shared:
             fields[1] = ["same", shared, "as"]
         elif count == 3:
@@ -502,7 +523,32 @@ def parse_fact(text, message=""):
     fields = _fact_fields(text, 3, message)
     if fields is None or fields[1] in RELATION_PLACEHOLDERS:
         return "()"
-    return _strings(*fields)
+    return _strings(fields[0], canonical_relation(fields[1]), fields[2])
+
+
+def _relations_canonical():
+    """relations.canonical, imported from this file's directory: PeTTa loads helper by path, with src off sys.path."""
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.append(here)
+    try:
+        from relations import canonical
+    except Exception as e:
+        logger.warning(f"Relation vocabulary unavailable: {e}")
+        return None
+    return canonical
+
+
+def canonical_relation(relation):
+    """The shared vocabulary name of a relation (see relations.py); same_<attribute>_as maps its attribute."""
+    canonical = _relations_canonical()
+    if canonical is None:
+        return relation
+    shared = shared_attribute(relation)
+    if shared:
+        return f"same_{canonical(shared)}_as"
+    return canonical(relation)
 
 
 def fact_term(subject, relation, value):
@@ -577,7 +623,7 @@ def parse_fact_key(text, message=""):
     fields = _fact_fields(text, 2, message)
     if fields is None:
         return "()"
-    return _strings(*fields)
+    return _strings(fields[0], canonical_relation(fields[1]))
 
 
 FACT_EXTRACTION_PROMPT = (
@@ -611,6 +657,8 @@ FACT_EXTRACTION_PROMPT = (
     "Niterói is in the same state as Rio. -> FACT Niterói | same state as | Rio\n"
     "Ana works in the same team as Bruno. -> FACT Ana | same team as | Bruno\n"
     "Ana does not work at Acme. -> NOT Ana | works at | Acme\n"
+    "Lyon's climate is not the same as Nice's. -> NOT Lyon | same climate as | Nice\n"
+    "Blood type O means universal donor. -> FACT O | means | universal donor\n"
     "I no longer live in Lisbon, I moved to Porto. -> NOT I | lives in | Lisbon\nFACT I | lives in | Porto\n"
     "What is my favorite color? -> LOOKUP I\n"
     "When is the standup and who runs it? -> LOOKUP standup\n"
@@ -679,8 +727,10 @@ _NEGATION = re.compile(r"(?i)(?:\bnot\b|\bnever\b|\bno\s+longer\b|\bno\s+more\b|
 
 
 def _phrase_in_text(phrase, text):
-    """True when the words of phrase appear in order as whole words in text."""
-    words = [w for w in re.findall(r"\w+", str(phrase or "").lower()) if w]
+    """True when the words of phrase appear in order as whole words in text, a possessive 's ignored."""
+    phrase = re.sub(r"['\u2019]s\b", "", str(phrase or ""))
+    text = re.sub(r"['\u2019]s\b", "", str(text or ""))
+    words = [w for w in re.findall(r"\w+", phrase.lower()) if w]
     if not words:
         return False
     return re.search(r"(?i)(?<!\w)" + r"\s+".join(re.escape(w) for w in words) + r"(?!\w)", text) is not None
@@ -709,8 +759,45 @@ def _message_denies_fact(entry, message):
 
 def extracted_facts(reply, message=""):
     """'subject | relation | value' strings from FACT entries, minus those the message denies."""
-    return _strings(*[entry for entry in _extraction_entries(reply, "FACT")
-                      if not _message_denies_fact(entry, message)])
+    entries = []
+    for entry in _extraction_entries(reply, "FACT"):
+        if _message_denies_fact(entry, message):
+            continue
+        for fact in _defined_code_facts(entry, message):
+            if fact not in entries:
+                entries.append(fact)
+    return _strings(*entries)
+
+
+DEFINING_RELATIONS = ("means", "stands for", "is short for")
+# A code as written in the message: Am, Cfa, BWh, A1. A word like "Means" is not one.
+CODE_TOKEN = re.compile(r"^[A-Z][A-Za-z0-9]{0,3}$")
+
+
+def _defined_code_facts(entry, message):
+    """'Koppen climate classification Am | means | X' as 'Am | means | X' and 'Am | is a | Koppen climate classification'.
+
+    The code must be the subject for it to join with the facts naming it as a
+    value ("orlando koppen_climate_classification cfa"), and the category tells
+    which attribute the code is a value of, so the known codes of an attribute
+    can be listed. The category is read from the subject or, when the
+    extraction dropped it, from the words before the code in the message.
+    """
+    parts = [p.strip() for p in _plain_text(entry).split("|")]
+    if len(parts) != 3 or parts[1].lower() not in DEFINING_RELATIONS:
+        return [entry]
+    words = parts[0].split()
+    code = words[-1] if words else ""
+    if not CODE_TOKEN.match(code):
+        return [entry]
+    category = " ".join(words[:-1])
+    if not category:
+        found = re.search(rf"((?:\w+\s+){{1,4}}?){re.escape(code)}\s+(?:{'|'.join(DEFINING_RELATIONS)})\b",
+                          _latest_text(message))
+        category = found.group(1).strip() if found else ""
+    category = re.sub(r"(?i)^(?:the|a|an)\s+", "", category)
+    defined = f"{code} | {parts[1]} | {parts[2]}"
+    return [defined, f"{code} | is a | {category}"] if category else [defined]
 
 
 def extracted_denials(reply, message=""):
@@ -953,7 +1040,7 @@ def recall_keys(message, lookups, indexed, limit=3, previous="()"):
     return _strings(*names)
 
 
-FACT_VERB_RELATIONS = ("is", "are", "has", "have", "likes", "loves", "hates", "owns", "lives", "works")
+FACT_VERB_RELATIONS = ("is", "are", "has", "have", "likes", "loves", "hates", "owns", "lives", "works", "means")
 SECOND_PERSON_VERBS = {"is": "are", "has": "have"}
 
 
@@ -975,8 +1062,13 @@ def _negated(verb):
 def _fact_sentence(subject, relation, value, speaker, denied=False):
     shared = shared_attribute(relation)
     if shared:
-        verb = "are" if subject == speaker else "is"
-        return f"{'you' if subject == speaker else subject} {verb}{' not' if denied else ''} in the same {shared} as {value}"
+        who = "you" if subject == speaker else subject
+        if shared in PLACE_KINDS or shared in ("city", "place", "town"):
+            verb = "are" if subject == speaker else "is"
+            return f"{who} {verb}{' not' if denied else ''} in the same {shared} as {value}"
+        has = "have" if subject == speaker else "has"
+        verb = ("do not have" if subject == speaker else "does not have") if denied else has
+        return f"{who} {verb} the same {shared.replace('_', ' ')} as {value}"
     relation, value = relation.replace("_", " "), value.replace("_", " ")
     words = relation.split()
     # "population is" reads as "population is is" once the sentence adds its own verb.
@@ -1013,7 +1105,24 @@ def _fact_tuples(facts):
     found = re.findall(r'\(\s*"([^"]*)"\s+(?:"([^"]*)"|([^\s()"]+))\s+"([^"]*)"'
                        r'(?:\s+"([^"]*)"\s+"([^"]*)"(?:\s+([0-9.eE+-]+))?)?\s*\)',
                        str(facts or ""))
-    return [(s, quoted or bare, v, who, when, _strength(strength)) for s, quoted, bare, v, who, when, strength in found]
+    return [_negated_tuple((s, quoted or bare, v, who, when, _strength(strength)))
+            for s, quoted, bare, v, who, when, strength in found]
+
+
+# A denied fact is stored as a true fact of the negated relation, not_<relation>,
+# because a bare Evaluation carries no truth value.
+NEGATED_PREFIX = "not_"
+
+
+def negated_relation(relation):
+    return NEGATED_PREFIX + str(relation)
+
+
+def _negated_tuple(fact):
+    subject, relation, value, who, when, strength = fact
+    if relation.startswith(NEGATED_PREFIX) and len(relation) > len(NEGATED_PREFIX):
+        return (subject, relation[len(NEGATED_PREFIX):], value, who, when, 0.0)
+    return fact
 
 
 def _strength(text):
@@ -1059,7 +1168,10 @@ INFERRED_SOURCE = "inferred: "
 def _shares(fact, attribute):
     """True when a fact gives the attribute itself: "state" or "home_state" for "state", or a value "florida state"."""
     relation, value = fact[1], fact[2].lower().split()
-    return not shared_attribute(relation) and (attribute in relation.split("_") or value[-1:] == [attribute])
+    if shared_attribute(relation):
+        return False
+    return (relation == attribute or attribute in relation.split("_")
+            or relation.endswith("_" + attribute) or value[-1:] == [attribute])
 
 
 def infer_shared_facts(facts):
@@ -1091,7 +1203,169 @@ def infer_shared_facts(facts):
                            f"{_fact_sentence(*fact[:3], '')}")
                 inferred.append((this, attribute, value, because, max(link[4], fact[4]), min(link[5], fact[5])))
                 break
+    # A denied link carries the other side's value over as a denied value:
+    # "miami not same climate as orlando" and "orlando climate cfa" give
+    # "miami's climate is not cfa".
+    for link in tuples:
+        attribute = shared_attribute(link[1])
+        if not attribute or not _denied(link):
+            continue
+        for this, other in ((link[0], link[2]), (link[2], link[0])):
+            if any(fact[0].lower() == this.lower() and _shares(fact, attribute) for fact in true):
+                continue
+            for fact in true:
+                if fact[0].lower() == other.lower() and _shares(fact, attribute):
+                    because = (f"{INFERRED_SOURCE}{_fact_sentence(*link[:3], '', denied=True)} and "
+                               f"{_fact_sentence(*fact[:3], '')}")
+                    # The other side's own relation, which names the attribute as the
+                    # agent that stored the value did (climate_classification for a
+                    # same_climate_as link), is the one its known values are stored under.
+                    inferred.append((this, fact[1], fact[2], because, max(link[4], fact[4]), 0.0))
     return _fact_list_text(tuples + inferred)
+
+
+GUESS_SOURCE = INFERRED_SOURCE + "a guess, "
+
+
+def _attribute_category(attribute):
+    return attribute.replace("_", " ")
+
+
+def _named_in(subject, message):
+    return not _latest_text(message) or _phrase_in_text(subject, _latest_text(message))
+
+
+def elimination_attributes(facts, message=""):
+    """Attributes some subject has only denied values for, whose known values could answer it by elimination.
+
+    Only a value denied through a link ("miami's climate is not the same as
+    orlando's") counts: a plain denial such as "ana does not work at acme" does
+    not ask which other value it is.
+    """
+    tuples = _fact_tuples(facts)
+    attributes = []
+    for fact in tuples:
+        subject, attribute = fact[0].lower(), fact[1]
+        if (not _denied(fact) or not fact[3].startswith(INFERRED_SOURCE)
+                or shared_attribute(attribute) or attribute in attributes or not _named_in(subject, message)):
+            continue
+        if any(other[0].lower() == subject and other[1] == attribute and not _denied(other) for other in tuples):
+            continue
+        attributes.append(attribute)
+    return _strings(*attributes)
+
+
+def attribute_options(attribute, values, members):
+    """The values an attribute is known to take: those stored under it, and the x of "x is_a <category>" pairs
+    whose category names the attribute.
+
+    Agents name the same attribute differently ("climate classification",
+    "koppen climate classification"), so a category matches when its words
+    contain the attribute's or the other way round.
+    """
+    wanted = set(_attribute_category(attribute).split())
+    options = []
+
+    def add(name):
+        if name and name.lower() not in options:
+            options.append(name.lower())
+
+    for value in re.findall(r'"([^"]*)"', str(values or "")):
+        add(value)
+    for name, category in re.findall(r'\(\s*"([^"]*)"\s+"([^"]*)"\s*\)', str(members or "")):
+        words = set(category.lower().split())
+        if wanted and words and (wanted <= words or words <= wanted):
+            add(name)
+    return _strings(*options)
+
+
+def hedge_facts(facts, candidates, message=""):
+    """Recall tuples plus a guess for each subject that has only denied values of an attribute.
+
+    candidates is (("attribute" ("value" ...)) ...): the values the attribute is
+    known to take, stored for any subject or as "value is_a <attribute>". The
+    ones left once the denied values are removed are the guess, "miami's
+    koppen climate classification is probably am", with the reason as its source.
+    """
+    tuples = _fact_tuples(facts)
+    known = {}
+    for attribute, values in re.findall(r'\(\s*"([^"]*)"\s+\(([^()]*)\)\s*\)', str(candidates or "")):
+        names = []
+        for value in re.findall(r'"([^"]*)"', values):
+            if value.lower() not in (n.lower() for n in names):
+                names.append(value.lower())
+        known[attribute] = names
+    guesses = []
+    for attribute, names in known.items():
+        if len(names) < 2:
+            continue
+        subjects = []
+        for fact in tuples:
+            if (fact[1] == attribute and _denied(fact) and fact[3].startswith(INFERRED_SOURCE)
+                    and fact[0].lower() not in subjects and _named_in(fact[0], message)):
+                subjects.append(fact[0].lower())
+        for subject in subjects:
+            if any(f[0].lower() == subject and f[1] == attribute and not _denied(f) for f in tuples):
+                continue
+            denied = [f[2].lower() for f in tuples if f[0].lower() == subject and f[1] == attribute and _denied(f)]
+            left = [name for name in names if name not in denied]
+            if not left or len(left) > 3:
+                continue
+            category = _attribute_category(attribute)
+            why = (f"{GUESS_SOURCE}the known {category} values are {' and '.join(names)}, "
+                   f"and {subject}'s is not {' or '.join(denied)}")
+            guesses.append((subject, attribute, " or ".join(left), why, "", 1.0))
+    return _fact_list_text(tuples + guesses)
+
+
+def _plain_value(fact):
+    return fact[1] not in {fact_token(r) for r in DEFINING_RELATIONS} | {"is_a"} and not shared_attribute(fact[1])
+
+
+def needs_definitions(facts, message=""):
+    """True when definitions are in play and a named subject has a value that may be what a code means."""
+    tuples = _fact_tuples(facts)
+    if not any(fact[1] in {fact_token(r) for r in DEFINING_RELATIONS} for fact in tuples):
+        return False
+    return any(_plain_value(fact) and not _denied(fact) and len(fact[2].split()) >= 2 and _named_in(fact[0], message)
+               for fact in tuples)
+
+
+def decoded_facts(facts, definitions, message=""):
+    """Recall tuples plus the code a stated meaning stands for.
+
+    "miami climate_classification tropical monsoon" with "am means tropical
+    monsoon climate" gives "miami climate_classification am": the user named
+    the meaning, other facts name the code, and both answer "what is Miami's
+    classification". definitions is (("code" "meaning") ...); a value matches a
+    meaning when the words of one contain the other's and share at least two.
+    """
+    tuples = _fact_tuples(facts)
+    pairs = re.findall(r'\(\s*"([^"]*)"\s+"([^"]*)"\s*\)', str(definitions or ""))
+    added = []
+    for fact in tuples:
+        if not _plain_value(fact) or _denied(fact) or not _named_in(fact[0], message):
+            continue
+        words = set(fact[2].lower().split())
+        for code, meaning in pairs:
+            meant = set(meaning.lower().split())
+            if code.lower() == fact[2].lower() or len(words & meant) < 2 or not (words <= meant or meant <= words):
+                continue
+            if any(f[0].lower() == fact[0].lower() and f[1] == fact[1] and f[2].lower() == code.lower() for f in tuples + added):
+                continue
+            added.append((fact[0], fact[1], code, f"{INFERRED_SOURCE}{fact[2]} is what {code} means", fact[4], 1.0))
+    return _fact_list_text(tuples + added)
+
+
+def guessed_values(facts):
+    """The values offered by guesses, each on its own, so their own facts (what am means) can be read."""
+    values = []
+    for fact in _fact_tuples(facts):
+        if fact[3].startswith(GUESS_SOURCE):
+            for value in fact[2].split(" or "):
+                if value and value not in values:
+                    values.append(value)
+    return _strings(*values)
 
 
 def fact_subjects(facts):
@@ -1138,11 +1412,22 @@ def new_subjects(facts, keys, speaker="", limit=3, message="", external=True):
         if name and name.lower() not in known and name.lower() not in (s.lower() for s in subjects):
             subjects.append(name)
 
-    for fact in _fact_tuples(facts):
-        if shared_attribute(fact[1]) and not _denied(fact):
+    tuples = _fact_tuples(facts)
+    links = [shared_attribute(fact[1]) for fact in tuples if shared_attribute(fact[1])]
+    asked = {word for word in re.findall(r"\w+", _latest_text(message).lower()) if len(word) > 3}
+    for fact in tuples:
+        if shared_attribute(fact[1]):
             add(fact[2])
             add(fact[0])
-    for fact in _fact_tuples(facts):
+    # A value that is itself described elsewhere ("cfa means humid subtropical
+    # climate") is read when the message asks about its relation or a link
+    # shares it: "orlando koppen_climate_classification cfa" for "the climate of Orlando".
+    for fact in tuples:
+        if (not shared_attribute(fact[1]) and not _denied(fact) and len(fact[2].split()) <= 3
+                and fact[1] not in {fact_token(r) for r in DEFINING_RELATIONS} | {"is_a"}
+                and (any(_shares(fact, attribute) for attribute in links) or asked & set(fact[1].split("_")))):
+            add(fact[2])
+    for fact in tuples:
         add(fact[0])
     for key in key_list if external else []:
         if not _latest_text(message) or key.lower() not in have_lower:
@@ -1186,8 +1471,16 @@ def describe_facts(facts, message=""):
     if not found:
         return "none"
     found.sort(key=lambda fact: fact[4], reverse=True)
-    return "; ".join(_fact_sentence(subject, relation, value, speaker, denied=_denied(fact)) + _fact_source(who, when, speaker)
+    return "; ".join(_hedged(_fact_sentence(subject, relation, value, speaker, denied=_denied(fact)), who)
+                     + _fact_source(who, when, speaker)
                      for fact in found for subject, relation, value, who, when, _ in [fact]) + "."
+
+
+def _hedged(sentence, who):
+    """A guessed fact reads 'is probably am' rather than 'is am'."""
+    if not str(who).startswith(GUESS_SOURCE):
+        return sentence
+    return re.sub(r" (is|are) ", r" \1 probably ", sentence, count=1)
 
 
 def is_statement(reply, message=""):

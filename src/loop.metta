@@ -126,7 +126,8 @@
           ($found (unique-atom (union-atom $facts $joint)))
           ($more (expand-subjects $found $keys $speaker))
           ($merged (py-call (helper.merge_facts (repr (union-atom $found $more)))))
-          ($known (sread (py-call (helper.infer_shared_facts $merged)))))
+          ($inferred (sread (py-call (helper.infer_shared_facts $merged))))
+          ($known (hedge-facts (decode-facts $inferred))))
      (change-state! &knownFacts (py-call (helper.describe_known_facts (repr $known) (repr $keys) $msg)))))
 
 ; Small models often send idle chatter such as "No new user input." despite the
@@ -155,6 +156,7 @@
                          " For UNANSWERED-HUMAN-MSG, send the answer built from its RESULTS_GATHERED_FOR_IT. Do not repeat a skill call already shown there." (newline)
                          " KNOWN_FACTS are learned facts related to the user message, written to the user: your means the user's, never yours." (newline)
                          " Answer questions from KNOWN_FACTS in the same person, for example: Your favorite color is blue. Never invent a fact that is not there." (newline)
+                         " A fact in KNOWN_FACTS marked a guess is the answer to give: lead with it, say probably and the reason in one short sentence, for example: send Probably Am (tropical monsoon): it is not Cfa like Orlando, and Am is the other classification I know. No disclaimers." (newline)
                          " When KNOWN_FACTS starts with just stored, the user only told you something: acknowledge just that in one short sentence, for example: send Got it, Miami is called the Magic City. Do not repeat earlier answers or other facts. When KNOWN_FACTS says nothing was stored, tell the user you could not store it and ask them to say it more simply." (newline)
                          (groundedRule)
                          " Use unlearn only to remove a fact that is no longer true." (newline)
@@ -166,7 +168,7 @@
 (= (groundedRule)
    (if (groundedAnswers)
        (py-str (" KNOWN_FACTS is all you know, read from DAS: answer only with those facts and what follows from them by reasoning, never from your own knowledge or the web; there is no query to run."
-                " When KNOWN_FACTS says nothing is stored about a name, tell the user you do not know anything about it yet." (newline)))
+                " When KNOWN_FACTS says nothing is stored about a name, tell the user you do not know anything about it yet. Never offer to research or look something up." (newline)))
        ""))
 
 (= (addTelegramPromptExtension)

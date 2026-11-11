@@ -117,6 +117,12 @@
       ((Error $type) "")
       ($msg $msg))))
 
+(= (current-known-facts)
+   (case (catch (get-state &knownFacts))
+     (((Error $type $ctx) "")
+      ((Error $type) "")
+      ($facts $facts))))
+
 ; The truth given to a fact a user states, and to one the user denies.
 (= (factTruth) (stv 1.0 0.9))
 (= (deniedTruth) (stv 0.0 0.9))
@@ -186,15 +192,22 @@
    (let $term (fact-term $s $r $v)
      (catch (remove-atom &das $term))))
 
-; A stated fact is added and a denied one removed, with no query first: the
+; A bare Evaluation has no truth, so a denied fact is stored as the true fact
+; of the negated relation, "miami not_same_climate_as orlando", which recall
+; reads back as the denial. A denial also removes the fact it denies, in case
+; it was stated before; a stated fact only adds. There is no query first: the
 ; handle is the hash of the term, so adding a stored fact again changes
 ; nothing, and removing one that is not stored is caught.
 (= (store-fact-as $s $r $v $tv $report)
-   (let* (((stv $strength $confidence) $tv)
-          ($term (fact-term $s $r $v)))
-     (if (> $strength 0.5)
-         (progn (add-atom &das $term) ($report $s $r $v))
-         (progn (catch (remove-atom &das $term)) ($report $s $r $v)))))
+   (if (> (stv-strength $tv) 0.5)
+       (let $term (fact-term $s $r $v)
+         (progn (add-atom &das $term) ($report $s $r $v)))
+       (let* (($old (fact-term $s $r $v))
+              ($_ (catch (remove-atom &das $old)))
+              ($term (fact-term $s (py-call (helper.negated_relation $r)) $v)))
+         (progn (add-atom &das $term) ($report $s $r $v)))))
+
+(= (stv-strength (stv $strength $confidence)) $strength)
 
 (= (store-fact $s $r $v) (store-fact-as $s $r $v (factTruth) LEARNED))
 
@@ -301,15 +314,63 @@
 ; stored and lowercase (another agent's "Team A", Omega's "team a"). Subjects
 ; that were keys, or the sender, are already read in full, except the other
 ; spelling of a key whose facts came back only under Omega's lowercase form.
+; Each round reads the names the facts found so far point to, so a chain of
+; facts on different peers is followed: miami, not the same climate as
+; orlando; orlando's climate cfa; cfa means humid subtropical. Each round's
+; names become keys, so no name is read twice.
+(= (maxExpandRounds) 3)
+
 (= (expand-subjects $facts $keys $speaker)
-   (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts) (current-message) (readExternalFacts))))
-     (if (== $subjects ())
-         ()
-         (let $more (recall-failure
-                      (catch (unique-atom (collapse (let $subject (superpose $subjects)
-                                                      (let $found (subject-facts $subject) (superpose $found)))))))
-           (progn (log INFO "das-memory" (DAS_EXPANDED $subjects FOUND: (size-atom $more)))
-                  $more)))))
+   (expand-rounds $facts $keys $speaker (maxExpandRounds)))
+
+(= (expand-rounds $facts $keys $speaker $rounds)
+   (if (< $rounds 1)
+       ()
+       (let $subjects (sread (py-call (helper.new_subjects (repr $facts) (repr $keys) $speaker (maxFactConcepts) (current-message) (readExternalFacts))))
+         (if (== $subjects ())
+             ()
+             (let* (($more (recall-failure
+                             (catch (unique-atom (collapse (let $subject (superpose $subjects)
+                                                             (let $found (subject-facts $subject) (superpose $found))))))))
+                    ($_ (log INFO "das-memory" (DAS_EXPANDED $subjects FOUND: (size-atom $more))))
+                    ($next (expand-rounds (unique-atom (union-atom $facts $more)) (union-atom $keys $subjects) $speaker (- $rounds 1))))
+               (unique-atom (union-atom $more $next)))))))
+
+; When a subject has only a value denied through a link ("miami's climate is
+; not cfa"), the values the attribute is known to take are read, from any
+; subject and from "x is_a <attribute>", and the ones left are offered as a
+; guess, with the facts about each (what am means). Two queries per attribute,
+; both on a grounded Predicate, and one per guessed value.
+(= (attribute-candidates $attribute)
+   (let* (($values (collapse (match &das (Evaluation (Predicate $attribute) (List (Concept $s) (Concept $v))) $v)))
+          ($members (collapse (match &das (Evaluation (Predicate "is_a") (List (Concept $x) (Concept $c))) ($x $c)))))
+     (sread (py-call (helper.attribute_options $attribute (repr $values) (repr $members))))))
+
+; A value the user gave as a meaning ("tropical monsoon") is matched to the
+; code defined with it ("am means tropical monsoon climate"): one query on the
+; grounded means Predicate, only when definitions were recalled.
+(= (decode-facts $known)
+   (if (py-call (helper.needs_definitions (repr $known) (current-message)))
+       (let $definitions (query-failure
+                           (catch (collapse (match &das (Evaluation (Predicate "means") (List (Concept $code) (Concept $meaning)))
+                                                   ($code $meaning)))))
+         (sread (py-call (helper.decoded_facts (repr $known) (repr $definitions) (current-message)))))
+       $known))
+
+(= (hedge-facts $known)
+   (let $attributes (sread (py-call (helper.elimination_attributes (repr $known) (current-message))))
+     (if (== $attributes ())
+         $known
+         (let* (($candidates (query-failure
+                               (catch (collapse (let $attribute (superpose $attributes)
+                                                  ($attribute (attribute-candidates $attribute)))))))
+                ($guessed (sread (py-call (helper.hedge_facts (repr $known) (repr $candidates) (current-message)))))
+                ($values (sread (py-call (helper.guessed_values (repr $guessed)))))
+                ($more (recall-failure
+                         (catch (unique-atom (collapse (let $value (superpose $values)
+                                                         (let $found (subject-facts $value) (superpose $found)))))))))
+           (progn (log INFO "das-memory" (DAS_HEDGED $candidates GUESSED: $values))
+                  (sread (py-call (helper.merge_facts (repr (union-atom $guessed $more))))))))))
 
 ; Arguments are evaluated before a call, so the nondeterministic query must be
 ; collapsed inside the function that logs a failure, not passed to one.

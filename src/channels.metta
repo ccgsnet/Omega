@@ -26,7 +26,7 @@
 ;nothing is sent when nothing is left.
 !(change-state! &lastsend "")
 (= (send $msg)
-   (let $reply (py-call (helper.clean_reply $msg (current-message)))
+   (let $reply (py-call (helper.clean_reply $msg (current-message) (current-known-facts)))
      (if (py-call (helper.is_set $reply))
          (if (!= $reply (get-state &lastsend))
              (progn (change-state! &lastsend $reply)

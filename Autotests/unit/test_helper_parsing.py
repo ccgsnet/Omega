@@ -436,8 +436,9 @@ def test_same_attribute_facts_read_the_other_side_and_carry_its_value(helper):
     assert "inferred" not in helper.infer_shared_facts(
         '(("miami" "same_state_as" "orlando" "" "" 1.0) ("miami" "state" "texas" "" "" 1.0)'
         ' ("orlando" "state" "florida" "" "" 1.0))')
-    assert "inferred" not in helper.infer_shared_facts(
-        '(("miami" "same_state_as" "orlando" "bob" "" 0.0) ("orlando" "state" "florida" "" "" 1.0))')
+    assert helper.infer_shared_facts(
+        '(("miami" "same_state_as" "orlando" "bob" "" 0.0) ("orlando" "state" "florida" "" "" 1.0))').endswith(
+        '("miami" "state" "florida" "inferred: miami is not in the same state as orlando and orlando\'s state is florida" "" 0.0))')
 
 
 def test_grounded_answers_refuse_outside_knowledge(helper):
@@ -755,3 +756,102 @@ def test_membership_relation_fits_the_relation_limit(helper):
     assert helper.parse_fact("Orlando | is a city of | Florida", "arturgontijo: Orlando is a city of the Florida state.") == \
         '("orlando" "state" "florida")'
     assert helper.describe_learned("((FACT_NOT_LEARNED \"x\" \"y\"))") == "nothing was stored from this message"
+
+
+def test_denials_are_stored_as_negated_relations(helper):
+    message = "arturgontijo: Miami's Koppen climate classification is not the same as Orlando's"
+    assert helper.parse_fact("Miami | climate | Orlando", message) == '("miami" "same_climate_classification_as" "orlando")'
+    assert helper.negated_relation("same_climate_as") == "not_same_climate_as"
+    assert helper.describe_facts('(("miami" "not_same_climate_as" "orlando"))', "arturgontijo: x?") == \
+        "miami does not have the same climate as orlando."
+    assert helper.describe_facts('(("miami" "same_state_as" "orlando"))', "arturgontijo: x?") == \
+        "miami is in the same state as orlando."
+    inferred = helper.infer_shared_facts('(("miami" "not_same_state_as" "orlando" "" "" 1.0) '
+                                         '("orlando" "state" "florida" "" "" 1.0))')
+    assert '"miami" "state" "florida"' in inferred and inferred.endswith('"" 0.0))')
+    assert "miami's state is not florida" in helper.describe_facts(inferred, "arturgontijo: x?")
+
+
+# --- the climate demo: chains across peers and elimination -------------------
+
+def test_defined_codes_are_stored_under_the_code_with_their_category(helper):
+    message = "arturgontijo: Koppen climate classification Am means tropical monsoon climate"
+    assert helper.extracted_facts("FACT Koppen climate classification Am | means | tropical monsoon climate", message) == \
+        '("Am | means | tropical monsoon climate" "Am | is a | Koppen climate classification")'
+    assert helper.extracted_facts("FACT Am | means | tropical monsoon climate", message) == \
+        '("Am | means | tropical monsoon climate" "Am | is a | Koppen climate classification")'
+    assert helper.extracted_facts("FACT Ana | works at | Acme", "arturgontijo: Ana works at Acme") == '("Ana | works at | Acme")'
+    assert helper.describe_facts('(("cfa" "means" "humid subtropical climate"))', "x: y?") == "cfa means humid subtropical climate."
+
+
+def test_expansion_follows_links_and_asked_values(helper):
+    question = "arturgontijo: What do you know about the climate of Miami?"
+    link = '("miami" "not_same_koppen_climate_classification_as" "orlando" "" "" 1.0)'
+    orlando = '("orlando" "koppen_climate_classification" "cfa" "" "" 1.0) ("orlando" "population" "330 thousand" "" "" 1.0)'
+    assert helper.new_subjects(f"({link})", '("miami")', "arturgontijo", 3, question, False) == '("orlando")'
+    assert helper.new_subjects(f"({link} {orlando})", '("miami" "orlando")', "arturgontijo", 3, question, False) == '("cfa")'
+
+
+def test_a_denied_link_gives_a_hedged_guess_by_elimination(helper):
+    question = "arturgontijo: What is the Koppen climate classification of Miami?"
+    facts = helper.infer_shared_facts('(("miami" "not_same_koppen_climate_classification_as" "orlando" "" "" 1.0) '
+                                      '("orlando" "koppen_climate_classification" "cfa" "" "" 1.0))')
+    assert helper.elimination_attributes(facts, question) == '("koppen_climate_classification")'
+    assert helper.elimination_attributes(facts, "arturgontijo: What about Orlando?") == "()"
+    guessed = helper.hedge_facts(facts, '(("koppen_climate_classification" ("cfa" "am")))', question)
+    assert helper.guessed_values(guessed) == '("am")'
+    text = helper.describe_facts(guessed, question)
+    assert "miami's koppen climate classification is not cfa" in text
+    assert "miami's koppen climate classification is probably am (inferred: a guess" in text
+    assert helper.hedge_facts(facts, '(("koppen_climate_classification" ("cfa")))', question) == facts
+    plain = helper.infer_shared_facts('(("ana" "not_works_at" "acme" "" "" 1.0))')
+    assert helper.elimination_attributes(plain, "arturgontijo: Where does Ana work?") == "()"
+
+
+def test_a_link_written_as_the_value_is_stored_as_a_link(helper):
+    message = "arturgontijo: Miami's Koppen climate classification is not the same as Orlando's"
+    for entry in ("Miami | Koppen climate classification | the same as Orlando's",
+                  "Miami | Koppen climate classification is | the same as Orlando's"):
+        assert helper.parse_fact(entry, message) == '("miami" "same_climate_classification_as" "orlando")'
+    fact = "FACT Miami | Koppen climate classification | the same as Orlando's"
+    assert helper.extracted_facts(fact, message) == "()"
+    assert helper.extracted_denials(fact, message) == '("Miami | Koppen climate classification | the same as Orlando\'s")'
+
+
+def test_attribute_options_match_differently_named_categories(helper):
+    members = '(("cfa" "koppen climate classification") ("am" "koppen climate classification") ("banana" "fruit"))'
+    assert helper.attribute_options("climate_classification", '("cfa")', members) == '("cfa" "am")'
+    assert helper.attribute_options("koppen_climate_classification", "()", members) == '("cfa" "am")'
+    assert helper.attribute_options("population", "()", members) == "()"
+
+
+def test_relations_map_to_the_shared_vocabulary_by_alias(helper):
+    orlando = "arturgontijo: Orlando's Koppen climate classification is Cfa"
+    for relation in ("Koppen climate classification", "climate classification", "climate"):
+        assert helper.parse_fact(f"Orlando | {relation} | Cfa", orlando) == '("orlando" "climate_classification" "cfa")'
+    assert helper.parse_fact("Orlando | is called | City Beautiful", "arturgontijo: Orlando is called the City Beautiful.") == \
+        '("orlando" "nickname" "city beautiful")'
+    assert helper.parse_fact("Miami | same climate as | Orlando", "arturgontijo: x") == \
+        '("miami" "same_climate_classification_as" "orlando")'
+    assert helper.parse_fact("Cfa | means | humid subtropical", "arturgontijo: x") == '("cfa" "means" "humid subtropical")'
+    assert helper.parse_fact("Ana | similar to | Bruno", "arturgontijo: x") == '("ana" "similar_to" "bruno")'
+    assert helper.parse_fact_key("I | climate", "arturgontijo: x") == '("arturgontijo" "climate_classification")'
+
+
+def test_got_it_is_dropped_on_any_recall_turn(helper):
+    reply = "Got it\u2014Miami's climate classification is am."
+    assert helper.clean_reply(reply, "arturgontijo: Tell me Miami's classification", "miami's climate classification is am.") == \
+        "Miami's climate classification is am."
+    assert helper.clean_reply(reply, "arturgontijo: Miami is Am", "just stored: miami's climate classification is am.") == reply
+
+
+def test_a_stated_meaning_is_decoded_to_its_code(helper):
+    question = "arturgontijo: What is the Koppen climate classification of Miami?"
+    facts = ('(("miami" "climate_classification" "tropical monsoon" "" "" 1.0) '
+             '("cfa" "means" "humid subtropical climate" "" "" 1.0))')
+    assert helper.needs_definitions(facts, question)
+    decoded = helper.decoded_facts(facts, '(("am" "tropical monsoon climate") ("cfa" "humid subtropical climate"))', question)
+    assert "miami's climate classification is am (inferred: tropical monsoon is what am means)" in \
+        helper.describe_facts(decoded, question)
+    assert "cfa (inferred" not in helper.describe_facts(decoded, question)
+    assert not helper.needs_definitions('(("miami" "climate_classification" "tropical monsoon" "" "" 1.0))', question)

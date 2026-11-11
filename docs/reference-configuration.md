@@ -24,6 +24,8 @@ This reads a command-line override via `argk` (`name=value` on the MeTTa command
 | `wakeupInterval` | 600 (seconds) | How long idle before the next scheduled wake-up. |
 | `idleThinking` | `True` | Call the model on turns with no new or unanswered user message. `False` calls it only for a new message and the reply turns after it, which also disables scheduled wake-up work; `config/config.yaml` sets `False`. |
 | `groundedAnswers` | `False` | Answer only from the facts recalled from DAS (`KNOWN_FACTS`) and reasoning over them. `websearch`, `shell` and `query` are left out of the skill list and refused when called, and a question about a name with nothing stored reads `KNOWN_FACTS: none, nothing is stored about <name>`. `config/config.yaml` sets `True`. |
+| `relationVocabulary` | `True` | Map each learned relation to the shared vocabulary in `src/relations.py`, by alias and then by similarity with the local embedding model (`intfloat/e5-large-v2`), so agents writing to the same DAS store one predicate per meaning: "Koppen climate classification", "climate" and "climate type" all become `climate_classification`. A relation close to no entry keeps its own name; without the model only aliases apply. |
+| `relationVocabularyThreshold` | `0.85` | Cosine similarity a relation needs to take a vocabulary name. |
 
 ## Memory (`src/memory.metta`, `initMemory`)
 

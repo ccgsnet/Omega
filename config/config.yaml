@@ -60,6 +60,11 @@ dasExternalFacts: False
 # Answer only from the facts recalled from DAS and reasoning over them: websearch, shell and
 # query are hidden and refused, and a name with nothing stored is answered as unknown.
 groundedAnswers: True
+# Map each learned relation to the shared vocabulary in src/relations.py (by alias, then by
+# similarity with the local embedding model), so agents store one predicate per meaning.
+relationVocabulary: True
+# Similarity under which a relation keeps its own name.
+relationVocabularyThreshold: 0.85
 # Extract facts and lookup names from each user message with a separate model call
 autoLearnFacts: True
 # Output cap passed to the provider for that extraction call; reasoning models spend most of it thinking.
